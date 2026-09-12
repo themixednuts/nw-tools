@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, path::Path, process::Command};
+mod support;
 
-const LUAC: &str = r"E:\Projects\lua-5.1.5\src\luac.exe";
-const GOOD_LUA: &str = r"E:\Projects\az-rs\resources\fixtures\lua\good-lua";
-const DEMOJSON: &str = r"E:\Projects\DEMOJSON";
+use std::{collections::BTreeMap, process::Command};
+
+use support::{demojson_root, good_lua_root, luac_path};
 const FIDELITY_GATE_SAMPLE_LIMIT: usize = 80;
 const FIDELITY_HEAVY_SAMPLE_LIMIT: usize = 300;
 
@@ -18,22 +18,29 @@ fn fidelity_gate_heavy_high_severity_regressions_stay_zero() {
 }
 
 fn run_fidelity_gate(limit: usize) {
-    if !Path::new(LUAC).exists() {
-        eprintln!("skipping fidelity gate; missing luac.exe at {LUAC}");
+    let Some(luac) = luac_path() else {
+        eprintln!(
+            "skipping fidelity gate; set {} to the reference luac.exe",
+            support::LUAC_EXE_ENV
+        );
         return;
-    }
-    if !Path::new(GOOD_LUA).exists() || !Path::new(DEMOJSON).exists() {
-        eprintln!("skipping fidelity gate; corpus roots are missing");
+    };
+    let (Some(good_lua), Some(demojson)) = (good_lua_root(), demojson_root()) else {
+        eprintln!(
+            "skipping fidelity gate; corpus roots are missing (set {} and {})",
+            support::GOOD_LUA_ROOT_ENV,
+            support::DEMOJSON_ROOT_ENV
+        );
         return;
-    }
+    };
 
     let output = Command::new(env!("CARGO_BIN_EXE_nw-lua-fidelity"))
         .arg("--luac")
-        .arg(LUAC)
+        .arg(luac)
         .arg("--root")
-        .arg(GOOD_LUA)
+        .arg(good_lua)
         .arg("--root")
-        .arg(DEMOJSON)
+        .arg(demojson)
         .arg("--limit")
         .arg(limit.to_string())
         .arg("--examples")

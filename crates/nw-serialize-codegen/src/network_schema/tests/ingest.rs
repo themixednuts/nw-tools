@@ -69,7 +69,7 @@ fn converts_ghidra_report_to_normalized_network_schema() {
         "schema": "newworld.network_schema.static.v1",
         "program": "NewWorld.exe",
         "imageBase": "NewWorld+0x0",
-        "input": "E:/Projects/new-world/resources/typeregistry.json",
+        "input": "fixtures/typeregistry.json",
         "registryEntries": [{
             "uuid": "A85DF621-DCE0-409F-8D39-A447EA0807FF",
             "index": 1637,
@@ -169,7 +169,7 @@ fn converts_ghidra_report_to_normalized_network_schema() {
     assert_eq!(schema.schema, NETWORK_SCHEMA_VERSION);
     assert_eq!(
         schema.sources[0].path.as_deref(),
-        Some("E:/Projects/new-world/resources/typeregistry.json")
+        Some("fixtures/typeregistry.json")
     );
     assert_eq!(
         schema.sources[0].schema.as_deref(),

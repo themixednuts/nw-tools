@@ -3,8 +3,7 @@
 A version-aware Lua bytecode (`.luac`) disassembler and SSA-based decompiler,
 derived algorithmically from
 [`Coldzer0/LuaDecompiler`](https://github.com/Coldzer0/LuaDecompiler) at commit
-`e75c48a73008187e88cc5a50a2dd06b884247923` (the local fixed clone is
-`E:\Projects\LuaDecompiler`). The Free Pascal reference is AGPL-3.0; see the
+`e75c48a73008187e88cc5a50a2dd06b884247923` (see also any local checkout of that repo). The Free Pascal reference is AGPL-3.0; see the
 licensing note below.
 
 **Complete target: Lua 5.1** (New World / Lumberyard-O3DE ScriptContext ships PUC-Rio
@@ -394,8 +393,8 @@ for NW. Validate early against `tests/shopcommon.luac` and `examples/*.decompile
   Do not modify other crates.
 - Stay within the current phase's scope. Leave clearly-marked `todo!()` /
   `// PHASE N:` stubs for later phases so the crate keeps compiling.
-- Read the mapped reference file(s) in `E:\Projects\LuaDecompiler` before porting a module,
-  and the matching PUC Lua source (`E:\Projects\lua-5.1.5\src\lundump.c`, `lopcodes.h`,
+- Read the mapped reference file(s) in the local `LuaDecompiler` checkout before porting a module,
+  and the matching PUC Lua source (`<lua-5.1.5>\src\lundump.c`, `lopcodes.h`,
   `lvm.c`) when opcode/format semantics are unclear.
 - **No monolithic files / god-objects** (see §1 rules 6–7). Strive for small, focused files;
   **hard cap ~1000 lines** (split before hitting it). When a ported reference file would blow

@@ -3,7 +3,7 @@
 Authoritative references:
 
 - Lua 5.1 Reference Manual: <https://www.lua.org/manual/5.1/>
-- Local PUC-Rio Lua 5.1.5 source: `E:\Projects\lua-5.1.5\src`
+- Local PUC-Rio Lua 5.1.5 source (`<lua-5.1.5>\src`, pointed at by `NW_LUA_EXE`/`NW_LUAC_EXE` for tests):
   - chunk format: `lundump.c`
   - opcode layout/modes: `lopcodes.h`, `lopcodes.c`
   - VM semantics: `lvm.c`

@@ -112,8 +112,8 @@ asset loader.
 
 ```powershell
 cargo run -p newworld-gamedata-codegen --bin nw-gamedata-codegen -- standalone `
-  --assets "E:\Games\steamapps\common\New World\assets" `
-  C:\Temp\new-world-gamedata
+  --assets "<Steam>\steamapps\common\New World\assets" `
+  tmp\new-world-gamedata
 ```
 
 Omit the language option to emit all three packages in one catalog/schema pass,

@@ -2478,7 +2478,12 @@ mod tests {
 
     #[test]
     fn real_rasc_and_raoc_catalogs_parse_when_present() {
-        let rasc_path = Path::new(r"E:\Projects\new-world\resources\assetcatalog.catalog");
+        let Some(rasc_path) =
+            std::env::var_os("NW_RASC_CATALOG_PATH").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipping: set NW_RASC_CATALOG_PATH to a real assetcatalog.catalog");
+            return;
+        };
         if !rasc_path.exists() {
             eprintln!(
                 "skipping: real RASC catalog not present at {}",
@@ -2504,9 +2509,10 @@ mod tests {
             Some(mapping.real())
         );
 
-        let raoc_path =
-            Path::new(r"E:\Projects\new-world\resources\assetcatalog_optimized.catalog");
-        if raoc_path.exists() {
+        if let Some(raoc_path) =
+            std::env::var_os("NW_RAOC_CATALOG_PATH").map(std::path::PathBuf::from)
+            && raoc_path.exists()
+        {
             let raoc_bytes = std::fs::read(raoc_path).unwrap();
             let raoc = Raoc::parse(&raoc_bytes).unwrap();
             assert!(!raoc.is_empty());

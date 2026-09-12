@@ -16,10 +16,10 @@ source:
    opcodes, SSA construction, control-flow recovery ideas, and differential
    validation. The inspected local checkout matches upstream `main` at
    `e75c48a73008187e88cc5a50a2dd06b884247923`.
-2. `E:\Projects\DEMOJSON` is the source-style oracle. Its 1,290 Lua files use
+2. `$NW_LUA_DEMOJSON_ROOT` is the source-style oracle. Its 1,290 Lua files use
    New World's module tables, PascalCase methods, lower-camel locals, and normal
    Lua constructor/declaration forms.
-3. `E:\Projects\new-world\resources\lua` is a prior-output corpus: all 1,394
+3. `<new-world>\resources\lua` is a prior-output corpus: all 1,394
    Lua files contain the `Decompiled by cLuaDecompiler` header. It is useful for
    seeing what Coldzer0 recovers, but not for deciding what original source
    looked like.

@@ -205,19 +205,19 @@ paths or APIs.
 
 Representative files inspected:
 
-- `E:\Projects\az-rs\resources\fixtures\lua\good-lua\scripts\_common\logger.lua`
-- `E:\Projects\az-rs\resources\fixtures\lua\good-lua\lyshineui\_common\uistyle.lua`
-- `E:\Projects\az-rs\resources\fixtures\lua\good-lua\scripts\combatimpact\impactcommon.lua`
-- `E:\Projects\DEMOJSON\scripts\weaponeffects\weaponeffectbase.lua`
-- `E:\Projects\DEMOJSON\scripts\gameplay\env\area_trigger.lua`
-- `E:\Projects\DEMOJSON\lyshineui\guildmenu\cresttab.lua`
-- `E:\Projects\DEMOJSON\lyshineui\_common\timehelperfunctions.lua`
-- `E:\Projects\LuaDecompiler\examples\abilitiescommon.decompiled.lua`
+- `$NW_LUA_GOOD_LUA_ROOT\scripts\_common\logger.lua`
+- `$NW_LUA_GOOD_LUA_ROOT\lyshineui\_common\uistyle.lua`
+- `$NW_LUA_GOOD_LUA_ROOT\scripts\combatimpact\impactcommon.lua`
+- `$NW_LUA_DEMOJSON_ROOT\scripts\weaponeffects\weaponeffectbase.lua`
+- `$NW_LUA_DEMOJSON_ROOT\scripts\gameplay\env\area_trigger.lua`
+- `$NW_LUA_DEMOJSON_ROOT\lyshineui\guildmenu\cresttab.lua`
+- `$NW_LUA_DEMOJSON_ROOT\lyshineui\_common\timehelperfunctions.lua`
+- `<LuaDecompiler>\examples\abilitiescommon.decompiled.lua`
 - `crates\nw-lua\tests\phase8_closures.rs`
 - `crates\nw-lua\tests\phase9_naming.rs`
 
-Lightweight scan over `E:\Projects\DEMOJSON` plus
-`E:\Projects\az-rs\resources\fixtures\lua\good-lua`:
+Lightweight scan over `$NW_LUA_DEMOJSON_ROOT` plus
+`$NW_LUA_GOOD_LUA_ROOT`:
 
 - 1296 Lua files scanned.
 - 17800 `function Table:Name(...)` declarations.
@@ -234,7 +234,7 @@ names are overwhelmingly PascalCase.
 
 ### Table-return module/component shape
 
-`E:\Projects\az-rs\resources\fixtures\lua\good-lua\scripts\_common\logger.lua`:
+`$NW_LUA_GOOD_LUA_ROOT\scripts\_common\logger.lua`:
 
 ```lua
 local Logger = {
@@ -262,7 +262,7 @@ Observed:
 - Constants are upper snake.
 - Locals and ordinary fields are lowerCamel.
 
-`E:\Projects\DEMOJSON\scripts\gameplay\env\area_trigger.lua`:
+`$NW_LUA_DEMOJSON_ROOT\scripts\gameplay\env\area_trigger.lua`:
 
 ```lua
 local ActivateEntity = {
@@ -287,7 +287,7 @@ Observed:
 
 ### LyShine UI modules
 
-`E:\Projects\DEMOJSON\lyshineui\guildmenu\cresttab.lua`:
+`$NW_LUA_DEMOJSON_ROOT\lyshineui\guildmenu\cresttab.lua`:
 
 ```lua
 local CrestTab = {
@@ -320,7 +320,7 @@ Observed:
   PascalCase, while helpers such as `crestTabCommon` are lowerCamel.
 - Locals are lowerCamel.
 
-`E:\Projects\az-rs\resources\fixtures\lua\good-lua\lyshineui\_common\uistyle.lua`:
+`$NW_LUA_GOOD_LUA_ROOT\lyshineui\_common\uistyle.lua`:
 
 ```lua
 local styleHelpers = RequireScript("LyShineUI._Common.StyleHelpers")
@@ -340,7 +340,7 @@ Observed:
 
 ### Global/module hybrid scripts
 
-`E:\Projects\DEMOJSON\scripts\weaponeffects\weaponeffectbase.lua`:
+`$NW_LUA_DEMOJSON_ROOT\scripts\weaponeffects\weaponeffectbase.lua`:
 
 ```lua
 local dataLayer = RequireScript("LyShineUI.UiDataLayer")
@@ -362,7 +362,7 @@ Observed:
   side-effects and module API behavior.
 - Methods still use PascalCase colon declarations.
 
-`E:\Projects\az-rs\resources\fixtures\lua\good-lua\scripts\combatimpact\impactcommon.lua`:
+`$NW_LUA_GOOD_LUA_ROOT\scripts\combatimpact\impactcommon.lua`:
 
 ```lua
 function IsAttackRelatedToLocalPlayer(attackerEntityId, targetEntityId)
@@ -381,7 +381,7 @@ Observed:
 
 ### Current decompiler examples
 
-`E:\Projects\LuaDecompiler\examples\abilitiescommon.decompiled.lua`:
+`<LuaDecompiler>\examples\abilitiescommon.decompiled.lua`:
 
 ```lua
 return {backgroundPathByCategory = {...}, defaultBackgroundPath = "...", GetBackgroundPath = function(a0, a1)

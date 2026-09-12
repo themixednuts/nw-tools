@@ -9,16 +9,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use support::run_equivalence;
+use support::{
+    demojson_fixture, demojson_root, good_lua_fixture, good_lua_root, luac_path, run_equivalence,
+};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-
-const LUA: &str = r"E:\Projects\lua-5.1.5\src\lua.exe";
-const LUAC: &str = r"E:\Projects\lua-5.1.5\src\luac.exe";
-const GOOD_LUA: &str = r"E:\Projects\az-rs\resources\fixtures\lua\good-lua";
-const DEMOJSON: &str = r"E:\Projects\DEMOJSON";
-const LOGGER_LUA: &str =
-    r"E:\Projects\az-rs\resources\fixtures\lua\good-lua\scripts\_common\logger.lua";
 const CORPUS_FAST_SAMPLE_LIMIT: usize = 40;
 const CORPUS_HEAVY_SAMPLE_LIMIT: usize = 300;
 const CHILD_OK: &str = "NW_LUA_CORPUS_CHILD_OK";
@@ -455,16 +450,19 @@ fn nw_named_regressions_decompile_and_reparse() {
         return;
     }
 
-    for source in [
-        Path::new(r"E:\Projects\DEMOJSON\lyshineui\_common\difficultycolors.lua"),
-        Path::new(r"E:\Projects\DEMOJSON\lyshineui\_common\basescreeninternal.lua"),
+    for relative in [
+        "lyshineui/_common/difficultycolors.lua",
+        "lyshineui/_common/basescreeninternal.lua",
     ] {
-        if !source.exists() {
-            eprintln!("skipping missing NW regression source {}", source.display());
+        let Some(source) = demojson_fixture(relative) else {
+            eprintln!(
+                "skipping missing NW regression source {relative}; set {}",
+                support::DEMOJSON_ROOT_ENV
+            );
             continue;
-        }
+        };
         let paths = TempPaths::new("phase9c_named");
-        compile_lua(source, &paths.bytecode).expect("compile NW regression source");
+        compile_lua(&source, &paths.bytecode).expect("compile NW regression source");
         let bytecode = fs::read(&paths.bytecode).expect("read compiled NW regression bytecode");
         let decompiled = nw_lua::decompile(&bytecode)
             .unwrap_or_else(|err| panic!("{} failed to decompile: {err}", source.display()));
@@ -484,14 +482,16 @@ fn nw_logger_create_channel_reconstructs_short_circuit_field() {
         eprintln!("skipping NW logger regression test; missing Lua 5.1 tools");
         return;
     }
-    let source = Path::new(LOGGER_LUA);
-    if !source.exists() {
-        eprintln!("skipping missing NW logger source {}", source.display());
+    let Some(source) = good_lua_fixture("scripts/_common/logger.lua") else {
+        eprintln!(
+            "skipping missing NW logger source; set {}",
+            support::GOOD_LUA_ROOT_ENV
+        );
         return;
-    }
+    };
 
     let paths = TempPaths::new("logger_short_circuit");
-    compile_lua(source, &paths.bytecode).expect("compile logger source");
+    compile_lua(&source, &paths.bytecode).expect("compile logger source");
     let bytecode = fs::read(&paths.bytecode).expect("read logger bytecode");
     let decompiled = nw_lua::decompile(&bytecode).expect("logger decompiles");
     full_moon::parse(&decompiled)
@@ -523,8 +523,12 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
         eprintln!("skipping NW corpus test; missing Lua 5.1 tools");
         return;
     }
-    if !Path::new(GOOD_LUA).exists() || !Path::new(DEMOJSON).exists() {
-        eprintln!("skipping NW corpus test; corpus roots are missing");
+    if good_lua_root().is_none() || demojson_root().is_none() {
+        eprintln!(
+            "skipping NW corpus test; corpus roots are missing (set {} and {})",
+            support::GOOD_LUA_ROOT_ENV,
+            support::DEMOJSON_ROOT_ENV
+        );
         return;
     }
     let Some(worker) = option_env!("CARGO_BIN_EXE_nw-lua-corpus-child") else {
@@ -656,9 +660,15 @@ print(#t, t[1], t[50], t[75])
 }
 
 fn run_child_structural(worker: &Path, bytecode: &Path) -> Result<ChildReport, FileResult> {
+    let Some(luac) = luac_path() else {
+        return Err(FileResult::Err(format!(
+            "luac unavailable; set {}",
+            support::LUAC_EXE_ENV
+        )));
+    };
     let output = Command::new(worker)
         .arg("--structural")
-        .arg(LUAC)
+        .arg(luac)
         .arg(bytecode)
         .output()
         .map_err(|err| FileResult::Crash(err.to_string()))?;
@@ -715,8 +725,10 @@ fn parse_child_report_line(line: &str) -> ChildReport {
 }
 
 fn corpus_files(limit: usize) -> Vec<PathBuf> {
-    let mut files = collect_lua_files(Path::new(GOOD_LUA));
-    files.extend(collect_lua_files(Path::new(DEMOJSON)));
+    let mut files = Vec::new();
+    for root in [good_lua_root(), demojson_root()].into_iter().flatten() {
+        files.extend(collect_lua_files(&root));
+    }
     files.sort();
     files.truncate(limit);
     files
@@ -747,11 +759,14 @@ fn collect_lua_files(root: &Path) -> Vec<PathBuf> {
 }
 
 fn tools_available() -> bool {
-    Path::new(LUA).exists() && Path::new(LUAC).exists()
+    support::lua_path().is_some() && luac_path().is_some()
 }
 
 fn compile_lua(source: &Path, bytecode: &Path) -> Result<(), String> {
-    let output = Command::new(LUAC)
+    let Some(luac) = luac_path() else {
+        return Err(format!("luac unavailable; set {}", support::LUAC_EXE_ENV));
+    };
+    let output = Command::new(luac)
         .arg("-o")
         .arg(bytecode)
         .arg(source)

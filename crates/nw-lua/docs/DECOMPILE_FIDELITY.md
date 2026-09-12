@@ -10,8 +10,8 @@ parses or recompiles. The analyzer compares original Lua source against
 classes. It shells the existing `nw-lua-fidelity` analyzer over the fixed sorted
 corpus roots:
 
-- `E:\Projects\az-rs\resources\fixtures\lua\good-lua`
-- `E:\Projects\DEMOJSON`
+- `$NW_LUA_GOOD_LUA_ROOT`
+- `$NW_LUA_DEMOJSON_ROOT`
 
 The default test runs `--limit 80 --examples 0` and skips cleanly if `luac.exe`
 or the corpus roots are absent. A heavier `--limit 300` sweep is available as an
@@ -36,9 +36,9 @@ Command:
 
 ```text
 cargo run -p nw-lua --bin nw-lua-fidelity -- \
-  --luac E:\Projects\lua-5.1.5\src\luac.exe \
-  --root E:\Projects\az-rs\resources\fixtures\lua\good-lua \
-  --root E:\Projects\DEMOJSON \
+  --luac $NW_LUAC_EXE \
+  --root $NW_LUA_GOOD_LUA_ROOT \
+  --root $NW_LUA_DEMOJSON_ROOT \
   --limit 300 --examples 12
 ```
 

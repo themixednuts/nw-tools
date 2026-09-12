@@ -1,9 +1,8 @@
 mod support;
 
-use std::path::Path;
 use support::{compile_source_bytes, run_equivalence};
 
-use support::compile_file_bytes;
+use support::demojson_fixture;
 
 #[test]
 fn runtime_equivalence_phase6_boolean_cases() {
@@ -515,8 +514,14 @@ return usable
 
 #[test]
 fn convert_seconds_short_circuit_reconstruction_is_faithful() {
-    let source = Path::new(r"E:\Projects\DEMOJSON\lyshineui\_common\timehelperfunctions.lua");
-    let bytecode = match compile_file_bytes("r2_timehelper", source, false) {
+    let Some(source) = demojson_fixture("lyshineui/_common/timehelperfunctions.lua") else {
+        eprintln!(
+            "skipping missing NW fixture timehelperfunctions.lua; set {}",
+            support::DEMOJSON_ROOT_ENV
+        );
+        return;
+    };
+    let bytecode = match support::compile_file_bytes("r2_timehelper", &source, false) {
         Some(bytecode) => bytecode,
         None => return,
     };

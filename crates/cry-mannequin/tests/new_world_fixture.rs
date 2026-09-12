@@ -8,8 +8,6 @@ use cry_mannequin::{
 
 const MANNEQUIN_FIXTURE_ROOT_ENV: &str = "NW_TOOLS_MANNEQUIN_FIXTURE_ROOT";
 const BLENDSPACE_FIXTURE_ROOT_ENV: &str = "NW_TOOLS_BLENDSPACE_FIXTURE_ROOT";
-const DEFAULT_MANNEQUIN_FIXTURE_ROOT: &str = "E:/Projects/new-world/tmp/mannequin_e1c_raw";
-const DEFAULT_BLENDSPACE_FIXTURE_ROOT: &str = "E:/Projects/new-world/tmp/blendspace_e1d_raw";
 const LOST_COMMANDER_ANIMS: &str = "animations/mannequin/adb/isleofnight/lostcommander_anims.adb";
 const LOST_COMMANDER_SWORD_ANIMS: &str =
     "animations/mannequin/adb/isleofnight/lostcommander_swordanims.adb";
@@ -217,32 +215,20 @@ fn decodes_real_bison_turn_comb_fixture() {
 }
 
 fn read_mannequin_fixture(relative: &str) -> Option<Vec<u8>> {
-    read_external_fixture(
-        MANNEQUIN_FIXTURE_ROOT_ENV,
-        DEFAULT_MANNEQUIN_FIXTURE_ROOT,
-        relative,
-        "Mannequin",
-    )
+    read_external_fixture(MANNEQUIN_FIXTURE_ROOT_ENV, relative, "Mannequin")
 }
 
 fn read_blend_fixture(relative: &str) -> Option<Vec<u8>> {
-    read_external_fixture(
-        BLENDSPACE_FIXTURE_ROOT_ENV,
-        DEFAULT_BLENDSPACE_FIXTURE_ROOT,
-        relative,
-        "blend-space",
-    )
+    read_external_fixture(BLENDSPACE_FIXTURE_ROOT_ENV, relative, "blend-space")
 }
 
-fn read_external_fixture(
-    root_env: &str,
-    default_root: &str,
-    relative: &str,
-    fixture_kind: &str,
-) -> Option<Vec<u8>> {
-    let root = std::env::var_os(root_env)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(default_root));
+fn read_external_fixture(root_env: &str, relative: &str, fixture_kind: &str) -> Option<Vec<u8>> {
+    let Some(root) = std::env::var_os(root_env).map(PathBuf::from) else {
+        eprintln!(
+            "skipping real New World {fixture_kind} fixture {relative}: {root_env} is not set; regenerate it from Steam PAKs with nw-extract assets extract"
+        );
+        return None;
+    };
     let path = root.join(relative);
     match fs::read(&path) {
         Ok(bytes) => Some(bytes),

@@ -14,8 +14,8 @@ patches or isolated pattern exceptions.
 - `Coldzer0/LuaDecompiler` at commit `e75c48a73008187e88cc5a50a2dd06b884247923`
   is the algorithm and validation reference. Its string-oriented `TDecompiler`
   shape is not a Rust architecture to port.
-- `E:\Projects\DEMOJSON` is the New World source-style oracle.
-- `E:\Projects\new-world\resources\lua` contains 1,394 prior
+- `$NW_LUA_DEMOJSON_ROOT` is the New World source-style oracle.
+- `<new-world>\resources\lua` contains 1,394 prior
   `cLuaDecompiler` outputs. Use it as a reference-output corpus, not as original
   source.
 - Fix facts at the earliest owning layer. Emission only lowers the final AST.

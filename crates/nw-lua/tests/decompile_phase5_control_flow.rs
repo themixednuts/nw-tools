@@ -1,9 +1,8 @@
 mod support;
 
 use nw_lua::decompile;
-use std::path::Path;
 
-use support::{compile_file_bytes, compile_source_bytes, run_equivalence};
+use support::{compile_file_bytes, compile_source_bytes, demojson_fixture, run_equivalence};
 
 const NUMERIC_FOR: &[u8] = include_bytes!("fixtures/control_flow/numeric_for.luac");
 const WHILE_LOOP: &[u8] = include_bytes!("fixtures/control_flow/while.luac");
@@ -222,12 +221,14 @@ return M
 
 #[test]
 fn nw_get_background_path_preserves_returning_elseif_chain() {
-    let path = Path::new(r"E:\Projects\DEMOJSON\lyshineui\_common\abilitiescommon.lua");
-    if !path.exists() {
-        eprintln!("skipping missing NW fixture {}", path.display());
+    let Some(path) = demojson_fixture("lyshineui/_common/abilitiescommon.lua") else {
+        eprintln!(
+            "skipping missing NW fixture abilitiescommon.lua; set {}",
+            support::DEMOJSON_ROOT_ENV
+        );
         return;
-    }
-    let bytecode = match compile_file_bytes("abilitiescommon_background_path", path, false) {
+    };
+    let bytecode = match compile_file_bytes("abilitiescommon_background_path", &path, false) {
         Some(bytecode) => bytecode,
         None => return,
     };
@@ -259,12 +260,14 @@ fn nw_get_background_path_preserves_returning_elseif_chain() {
 
 #[test]
 fn nw_time_helper_preserves_guarded_returns_and_nested_body() {
-    let path = Path::new(r"E:\Projects\DEMOJSON\lyshineui\_common\timehelperfunctions.lua");
-    if !path.exists() {
-        eprintln!("skipping missing NW fixture {}", path.display());
+    let Some(path) = demojson_fixture("lyshineui/_common/timehelperfunctions.lua") else {
+        eprintln!(
+            "skipping missing NW fixture timehelperfunctions.lua; set {}",
+            support::DEMOJSON_ROOT_ENV
+        );
         return;
-    }
-    let bytecode = match compile_file_bytes("timehelper_convert_seconds", path, false) {
+    };
+    let bytecode = match compile_file_bytes("timehelper_convert_seconds", &path, false) {
         Some(bytecode) => bytecode,
         None => return,
     };

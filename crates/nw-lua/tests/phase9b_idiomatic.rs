@@ -278,14 +278,14 @@ fn nw_corpus_robustness_report() {
     let mut failures = Vec::new();
     for source in &files {
         let paths = TempPaths::new("phase9b_corpus");
-        let result = compile_lua(tools.luac, source, &paths.bytecode)
+        let result = compile_lua(&tools.luac, source, &paths.bytecode)
             .and_then(|_| fs::read(&paths.bytecode).map_err(|err| err.to_string()))
             .and_then(|bytes| nw_lua::decompile(&bytes).map_err(|err| err.to_string()))
             .and_then(|decompiled| {
                 full_moon::parse(&decompiled).map_err(|errors| format!("{errors:#?}"))?;
                 reparse_ok += 1;
                 fs::write(&paths.decompiled, decompiled).map_err(|err| err.to_string())?;
-                compile_lua(tools.luac, &paths.decompiled, &paths.recompiled)?;
+                compile_lua(&tools.luac, &paths.decompiled, &paths.recompiled)?;
                 recompile_ok += 1;
                 Ok(())
             });
@@ -310,8 +310,8 @@ fn nw_corpus_robustness_report() {
 }
 
 struct LuaTools {
-    lua: &'static str,
-    luac: &'static str,
+    lua: PathBuf,
+    luac: PathBuf,
 }
 
 struct TempPaths {
@@ -383,11 +383,15 @@ impl SourceCasePaths {
 }
 
 fn lua_tools() -> Option<LuaTools> {
-    let tools = LuaTools {
-        lua: r"E:\Projects\lua-5.1.5\src\lua.exe",
-        luac: r"E:\Projects\lua-5.1.5\src\luac.exe",
+    let (Some(lua), Some(luac)) = (support::lua_path(), support::luac_path()) else {
+        eprintln!(
+            "skipping Lua 5.1 idiomatic tests; set {} and {}",
+            support::LUA_EXE_ENV,
+            support::LUAC_EXE_ENV
+        );
+        return None;
     };
-    (Path::new(tools.lua).exists() && Path::new(tools.luac).exists()).then_some(tools)
+    Some(LuaTools { lua, luac })
 }
 
 fn run_without_debug_locals(name: &str, source: &str) -> Option<String> {
@@ -395,9 +399,9 @@ fn run_without_debug_locals(name: &str, source: &str) -> Option<String> {
     let paths = SourceCasePaths::new(name);
     fs::create_dir_all(&paths.dir).expect("create temp source directory");
     fs::write(&paths.source, source).expect("write source-preserved synthetic case");
-    compile_lua(tools.luac, &paths.source, &paths.bytecode).expect("compile Lua source");
+    compile_lua(&tools.luac, &paths.source, &paths.bytecode).expect("compile Lua source");
 
-    let original_stdout = run_lua(tools.lua, &paths.source, "original Lua source");
+    let original_stdout = run_lua(&tools.lua, &paths.source, "original Lua source");
     let bytecode = fs::read(&paths.bytecode).expect("read bytecode");
     let mut chunk = nw_lua::parse_chunk(&bytecode).expect("parse bytecode");
     clear_debug_names(&mut chunk.root);
@@ -408,7 +412,7 @@ fn run_without_debug_locals(name: &str, source: &str) -> Option<String> {
     let decompiled = nw_lua::to_source(&block).expect("emit decompiled source");
 
     fs::write(&paths.decompiled, &decompiled).expect("write decompiled source");
-    let decompiled_stdout = run_lua(tools.lua, &paths.decompiled, "decompiled Lua source");
+    let decompiled_stdout = run_lua(&tools.lua, &paths.decompiled, "decompiled Lua source");
     assert_eq!(
         original_stdout, decompiled_stdout,
         "{name} stdout differed\nsource:\n{decompiled}"
@@ -427,7 +431,7 @@ fn clear_debug_names(proto: &mut nw_lua::chunk::Proto) {
     }
 }
 
-fn run_lua(lua: &str, source: &Path, context: &str) -> Vec<u8> {
+fn run_lua(lua: &Path, source: &Path, context: &str) -> Vec<u8> {
     let output = Command::new(lua)
         .arg(source)
         .output()
@@ -436,12 +440,12 @@ fn run_lua(lua: &str, source: &Path, context: &str) -> Vec<u8> {
 }
 
 fn corpus_files(limit: usize) -> Vec<PathBuf> {
-    let roots = [
-        Path::new(r"E:\Projects\az-rs\resources\fixtures\lua\good-lua"),
-        Path::new(r"E:\Projects\DEMOJSON"),
-    ];
+    let roots = [support::good_lua_root(), support::demojson_root()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let mut files = Vec::new();
-    for root in roots {
+    for root in &roots {
         collect_lua_files(root, limit, &mut files);
         if files.len() >= limit {
             break;
@@ -478,7 +482,7 @@ fn collect_lua_files(root: &Path, limit: usize, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn compile_lua(luac: &str, source: &Path, bytecode: &Path) -> Result<(), String> {
+fn compile_lua(luac: &Path, source: &Path, bytecode: &Path) -> Result<(), String> {
     let output = Command::new(luac)
         .arg("-o")
         .arg(bytecode)
