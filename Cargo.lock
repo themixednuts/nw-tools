@@ -513,7 +513,6 @@ dependencies = [
  "bevy_math",
  "bevy_reflect",
  "glam",
- "inventory",
  "serde",
  "thiserror 2.0.18",
  "uuid",
@@ -564,8 +563,8 @@ name = "az-jobs"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "ctrlc",
  "rayon",
- "signal-hook 0.4.4",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -586,8 +585,17 @@ name = "az-turso"
 version = "0.1.0"
 dependencies = [
  "async-lock",
+ "fs2",
  "thiserror 2.0.18",
  "turso",
+ "turso_core",
+ "turso_ext",
+ "turso_macros",
+ "turso_parser",
+ "turso_sdk_kit",
+ "turso_sdk_kit_macros",
+ "turso_sync_engine",
+ "turso_sync_sdk_kit",
 ]
 
 [[package]]
@@ -596,7 +604,6 @@ version = "0.1.0"
 dependencies = [
  "az-jobs",
  "futures",
- "signal-hook 0.4.4",
  "tokio-util",
  "tracing",
 ]
