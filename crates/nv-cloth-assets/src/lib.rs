@@ -793,7 +793,9 @@ fn parse_simulation_vertices(
     bytes: &[u8],
 ) -> Result<Vec<ClothSimulationVertex>, ClothFabricParseError> {
     bytes
-        .chunks_exact(64)
+        .as_chunks::<64>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, record)| {
             ensure_zero_padding(record, 12..16, "simulation vertex position", index)?;
@@ -854,7 +856,9 @@ fn parse_render_mapping(
         16,
         "barycentric map ranges",
     )?
-    .chunks_exact(16)
+    .as_chunks::<16>()
+    .0
+    .iter()
     .enumerate()
     {
         ensure_zero_padding(record, 8..16, "barycentric map range", index)?;
@@ -875,7 +879,9 @@ fn parse_render_mapping(
         32,
         "barycentric render mapping",
     )?
-    .chunks_exact(32)
+    .as_chunks::<32>()
+    .0
+    .iter()
     .enumerate()
     {
         ensure_zero_padding(record, 20..32, "barycentric map entry", index)?;
@@ -934,37 +940,28 @@ fn block<'a>(
 
 fn decode_u32s(bytes: &[u8]) -> Result<Vec<u32>, ClothFabricParseError> {
     bytes
-        .chunks_exact(4)
-        .map(|value| {
-            value
-                .try_into()
-                .map(u32::from_le_bytes)
-                .map_err(|_| ClothFabricParseError::InvalidScalarArray)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|value| Ok(u32::from_le_bytes(*value)))
         .collect()
 }
 
 fn decode_i32s(bytes: &[u8]) -> Result<Vec<i32>, ClothFabricParseError> {
     bytes
-        .chunks_exact(4)
-        .map(|value| {
-            value
-                .try_into()
-                .map(i32::from_le_bytes)
-                .map_err(|_| ClothFabricParseError::InvalidScalarArray)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|value| Ok(i32::from_le_bytes(*value)))
         .collect()
 }
 
 fn decode_f32s(bytes: &[u8]) -> Result<Vec<f32>, ClothFabricParseError> {
     bytes
-        .chunks_exact(4)
-        .map(|value| {
-            value
-                .try_into()
-                .map(f32::from_le_bytes)
-                .map_err(|_| ClothFabricParseError::InvalidScalarArray)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|value| Ok(f32::from_le_bytes(*value)))
         .collect()
 }
 

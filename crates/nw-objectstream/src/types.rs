@@ -87,8 +87,10 @@ pub fn uuid_data_to_serialize(
         | MATRIX4X4 => {
             assert!(data.len().is_multiple_of(4));
             let floats = data
-                .chunks_exact(4)
-                .map(|b| f32::from_be_bytes(b.try_into().unwrap()));
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_be_bytes(*b));
 
             if is_json {
                 Value::Array(floats.map(float_json_number).collect())

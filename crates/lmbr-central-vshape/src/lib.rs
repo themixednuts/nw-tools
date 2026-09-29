@@ -147,7 +147,7 @@ impl<'a> VertexBytes<'a> {
     #[must_use]
     pub fn iter(&self) -> VertexIter<'a> {
         VertexIter {
-            chunks: self.bytes.chunks_exact(VERTEX_SIZE),
+            chunks: self.bytes.as_chunks::<VERTEX_SIZE>().0.iter(),
         }
     }
 }
@@ -158,7 +158,7 @@ impl<'a> IntoIterator for VertexBytes<'a> {
 
     fn into_iter(self) -> Self::IntoIter {
         VertexIter {
-            chunks: self.bytes.chunks_exact(VERTEX_SIZE),
+            chunks: self.bytes.as_chunks::<VERTEX_SIZE>().0.iter(),
         }
     }
 }
@@ -166,14 +166,14 @@ impl<'a> IntoIterator for VertexBytes<'a> {
 /// Iterator over borrowed vertex bytes.
 #[derive(Debug, Clone)]
 pub struct VertexIter<'a> {
-    chunks: std::slice::ChunksExact<'a, u8>,
+    chunks: std::slice::Iter<'a, [u8; VERTEX_SIZE]>,
 }
 
 impl Iterator for VertexIter<'_> {
     type Item = Vec3;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.chunks.next().map(read_vec3_chunk)
+        self.chunks.next().map(|chunk| read_vec3_chunk(chunk))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
