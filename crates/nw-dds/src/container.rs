@@ -410,7 +410,13 @@ pub fn decode_top_mip_with_attached_alpha<'a>(
     } else {
         3
     };
-    for (pixel, alpha_pixel) in color.rgba.chunks_exact_mut(4).zip(alpha.chunks_exact(4)) {
+    for (pixel, alpha_pixel) in color
+        .rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(alpha.as_chunks::<4>().0.iter())
+    {
         pixel[3] = alpha_pixel[signal];
     }
     Ok(color)
@@ -807,7 +813,7 @@ fn decode_texture_rgba(
 ) -> Result<Vec<u8>, Error> {
     let mut rgba = decode_rgba(format.vk, data, width, height)?;
     if format.alpha_mode == AlphaMode::Opaque {
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
             pixel[3] = u8::MAX;
         }
     }
@@ -882,7 +888,7 @@ fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<
     // a pre-sized buffer in 4-byte chunks (no per-pixel bounds checks / reallocs, and
     // vectorizable) rather than pushing one byte at a time.
     let mut rgba = vec![0u8; pixels * 4];
-    for (chunk, &color) in rgba.chunks_exact_mut(4).zip(out.iter()) {
+    for (chunk, &color) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(out.iter()) {
         chunk[0] = (color >> 16) as u8;
         chunk[1] = (color >> 8) as u8;
         chunk[2] = color as u8;
@@ -931,7 +937,12 @@ fn plain_rg16_snorm(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0.0f32; pixels * 4];
-    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+    for (pixel, rg) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<4>().0.iter())
+    {
         pixel[0] = snorm16_to_f32(i16::from_le_bytes([rg[0], rg[1]]));
         pixel[1] = snorm16_to_f32(i16::from_le_bytes([rg[2], rg[3]]));
         pixel[3] = 1.0;
@@ -1071,7 +1082,7 @@ fn plain_rgba(data: &[u8], pixels: usize, swap_rb: bool) -> Result<Vec<u8>, Erro
         })?
         .to_vec();
     if swap_rb {
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
             pixel.swap(0, 2);
         }
     }
@@ -1084,7 +1095,7 @@ fn plain_r8(data: &[u8], pixels: usize) -> Result<Vec<u8>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0u8; pixels * 4];
-    for (pixel, &r) in rgba.chunks_exact_mut(4).zip(bytes.iter()) {
+    for (pixel, &r) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(bytes.iter()) {
         pixel[0] = r;
         pixel[3] = 255;
     }
@@ -1100,7 +1111,12 @@ fn plain_rg8(data: &[u8], pixels: usize) -> Result<Vec<u8>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0u8; pixels * 4];
-    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(2)) {
+    for (pixel, rg) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<2>().0.iter())
+    {
         pixel[0] = rg[0];
         pixel[1] = rg[1];
         pixel[3] = 255;
@@ -1117,7 +1133,12 @@ fn plain_rgb8(data: &[u8], pixels: usize, swap_rb: bool) -> Result<Vec<u8>, Erro
         actual: data.len(),
     })?;
     let mut rgba = vec![0u8; pixels * 4];
-    for (pixel, rgb) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(3)) {
+    for (pixel, rgb) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<3>().0.iter())
+    {
         pixel[..3].copy_from_slice(rgb);
         if swap_rb {
             pixel.swap(0, 2);
@@ -1133,7 +1154,7 @@ fn plain_a8(data: &[u8], pixels: usize) -> Result<Vec<u8>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![u8::MAX; pixels * 4];
-    for (pixel, &alpha) in rgba.chunks_exact_mut(4).zip(bytes) {
+    for (pixel, &alpha) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(bytes) {
         pixel[3] = alpha;
     }
     Ok(rgba)
@@ -1148,7 +1169,12 @@ fn plain_r16(data: &[u8], pixels: usize) -> Result<Vec<u16>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0u16; pixels * 4];
-    for (pixel, r) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(2)) {
+    for (pixel, r) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<2>().0.iter())
+    {
         pixel[0] = u16::from_le_bytes([r[0], r[1]]);
         pixel[3] = u16::MAX;
     }
@@ -1164,7 +1190,12 @@ fn plain_rg16(data: &[u8], pixels: usize) -> Result<Vec<u16>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0u16; pixels * 4];
-    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+    for (pixel, rg) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<4>().0.iter())
+    {
         pixel[0] = u16::from_le_bytes([rg[0], rg[1]]);
         pixel[1] = u16::from_le_bytes([rg[2], rg[3]]);
         pixel[3] = u16::MAX;
@@ -1181,7 +1212,7 @@ fn plain_rgba16(data: &[u8], pixels: usize) -> Result<Vec<u16>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = Vec::with_capacity(pixels * 4);
-    for sample in bytes.chunks_exact(2) {
+    for sample in bytes.as_chunks::<2>().0.iter() {
         rgba.push(u16::from_le_bytes([sample[0], sample[1]]));
     }
     Ok(rgba)
@@ -1196,7 +1227,12 @@ fn plain_r16f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0.0f32; pixels * 4];
-    for (pixel, r) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(2)) {
+    for (pixel, r) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<2>().0.iter())
+    {
         pixel[0] = half_to_f32(u16::from_le_bytes([r[0], r[1]]));
         pixel[3] = 1.0;
     }
@@ -1212,7 +1248,12 @@ fn plain_rg16f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0.0f32; pixels * 4];
-    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+    for (pixel, rg) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<4>().0.iter())
+    {
         pixel[0] = half_to_f32(u16::from_le_bytes([rg[0], rg[1]]));
         pixel[1] = half_to_f32(u16::from_le_bytes([rg[2], rg[3]]));
         pixel[3] = 1.0;
@@ -1229,7 +1270,7 @@ fn plain_rgba16f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = Vec::with_capacity(pixels * 4);
-    for sample in bytes.chunks_exact(2) {
+    for sample in bytes.as_chunks::<2>().0.iter() {
         rgba.push(half_to_f32(u16::from_le_bytes([sample[0], sample[1]])));
     }
     Ok(rgba)
@@ -1244,7 +1285,12 @@ fn plain_r32f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0.0f32; pixels * 4];
-    for (pixel, r) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+    for (pixel, r) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<4>().0.iter())
+    {
         pixel[0] = f32::from_le_bytes([r[0], r[1], r[2], r[3]]);
         pixel[3] = 1.0;
     }
@@ -1260,7 +1306,12 @@ fn plain_rg32f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0.0f32; pixels * 4];
-    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(8)) {
+    for (pixel, rg) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<8>().0.iter())
+    {
         pixel[0] = f32::from_le_bytes([rg[0], rg[1], rg[2], rg[3]]);
         pixel[1] = f32::from_le_bytes([rg[4], rg[5], rg[6], rg[7]]);
         pixel[3] = 1.0;
@@ -1277,7 +1328,12 @@ fn plain_rgb32f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = vec![0.0f32; pixels * 4];
-    for (pixel, rgb) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(12)) {
+    for (pixel, rgb) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<12>().0.iter())
+    {
         pixel[0] = f32::from_le_bytes([rgb[0], rgb[1], rgb[2], rgb[3]]);
         pixel[1] = f32::from_le_bytes([rgb[4], rgb[5], rgb[6], rgb[7]]);
         pixel[2] = f32::from_le_bytes([rgb[8], rgb[9], rgb[10], rgb[11]]);
@@ -1295,7 +1351,7 @@ fn plain_rgba32f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
         actual: data.len(),
     })?;
     let mut rgba = Vec::with_capacity(pixels * 4);
-    for sample in bytes.chunks_exact(4) {
+    for sample in bytes.as_chunks::<4>().0.iter() {
         rgba.push(f32::from_le_bytes([
             sample[0], sample[1], sample[2], sample[3],
         ]));
@@ -1575,7 +1631,7 @@ impl Texture {
             pad_to(&mut out, index[logical_level].byte_offset)?;
             let level = levels.bytes[logical_level].as_ref();
             if self.format.alpha_mode == AlphaMode::Opaque {
-                for pixel in level.chunks_exact(4) {
+                for pixel in level.as_chunks::<4>().0.iter() {
                     out.extend_from_slice(&pixel[..3]);
                     out.push(u8::MAX);
                 }
@@ -2437,8 +2493,10 @@ mod tests {
         assert!(
             decoded.images[0]
                 .rgba
-                .chunks_exact(4)
-                .all(|pixel| pixel == [0x77, 0, 0, 0xff])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [0x77, 0, 0, 0xff])
         );
 
         // Lossless full-chain conversion remains strict: it cannot invent the
@@ -2499,7 +2557,9 @@ mod tests {
         assert_eq!(
             decoded
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|pixel| pixel[3])
                 .collect::<Vec<_>>(),
             vec![0, 64, 128, 255]
@@ -2519,7 +2579,9 @@ mod tests {
         assert!(
             decoded
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .all(|pixel| pixel[0..3] == [0.0, 0.0, 0.0] && pixel[3] == 1.0)
         );
     }
@@ -2665,7 +2727,9 @@ mod tests {
             assert!(
                 image
                     .rgba
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .all(|pixel| pixel[0] == face as u8 * 10)
             );
         }
@@ -2674,17 +2738,33 @@ mod tests {
         let reader = ktx2::Reader::new(ktx.bytes()).unwrap();
         let levels = reader.levels().collect::<Vec<_>>();
         assert_eq!(levels.len(), 2);
-        for (face, image) in levels[0].data.chunks_exact(4 * 4 * 4).enumerate() {
+        for (face, image) in levels[0]
+            .data
+            .as_chunks::<{ 4 * 4 * 4 }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             assert!(
                 image
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .all(|pixel| pixel[0] == face as u8 * 10)
             );
         }
-        for (face, image) in levels[1].data.chunks_exact(2 * 2 * 4).enumerate() {
+        for (face, image) in levels[1]
+            .data
+            .as_chunks::<{ 2 * 2 * 4 }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             assert!(
                 image
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .all(|pixel| pixel[0] == face as u8 * 10 + 1)
             );
         }
@@ -2725,7 +2805,9 @@ mod tests {
             {
                 assert!(
                     image
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .all(|pixel| pixel[0] == face as u8 * 10 + level as u8)
                 );
             }
@@ -2738,7 +2820,9 @@ mod tests {
 
         assert_eq!(rgba.len(), 3 * 2 * 4);
         assert!(
-            rgba.chunks_exact(4)
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
                 .all(|pixel| pixel[0..3] == [0.0, 0.0, 0.0] && pixel[3] == 1.0)
         );
     }
@@ -2830,7 +2914,7 @@ mod tests {
         let mut out = vec![0u32; width * height];
         decode(data, width, height, &mut out).unwrap();
         let mut rgba = vec![0u8; width * height * 4];
-        for (chunk, &color) in rgba.chunks_exact_mut(4).zip(out.iter()) {
+        for (chunk, &color) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(out.iter()) {
             chunk[0] = (color >> 16) as u8;
             chunk[1] = (color >> 8) as u8;
             chunk[2] = color as u8;

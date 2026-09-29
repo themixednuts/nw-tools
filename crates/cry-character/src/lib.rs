@@ -547,7 +547,6 @@ impl CharacterAnimationAliasIndex {
         }
     }
 
-    #[must_use]
     pub fn aliases(&self) -> impl Iterator<Item = (&str, &str)> {
         self.paths_by_alias
             .iter()
@@ -650,7 +649,6 @@ impl CharacterAnimationOwnershipIndex {
             .get(&canonical_animation_clip_path(source_path))
     }
 
-    #[must_use]
     pub fn clips(&self) -> impl Iterator<Item = (&str, &BTreeSet<String>)> {
         self.skeletons_by_clip
             .iter()

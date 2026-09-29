@@ -323,7 +323,9 @@ fn parse_media_index(payload: &[u8]) -> Result<Vec<WwiseMediaEntry>, WwiseSoundB
         });
     }
     payload
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .map(|chunk| {
             Ok(WwiseMediaEntry {
                 id: WwiseMediaId(read_u32(chunk, 0, "DIDX media id")?),
@@ -398,12 +400,10 @@ fn parse_event_actions(
         .filter(|end| *end <= body.len())
         .ok_or(WwiseSoundBankParseError::HircEventActionsOutOfBounds { object_id })?;
     body[cursor..end]
-        .chunks_exact(4)
-        .map(|bytes| {
-            Ok(WwiseObjectId(u32::from_le_bytes(
-                bytes.try_into().expect("four bytes"),
-            )))
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| Ok(WwiseObjectId(u32::from_le_bytes(*bytes))))
         .collect()
 }
 
@@ -624,7 +624,9 @@ impl<'a> WwiseTriggerBankMap<'a> {
 
     pub fn entries(self) -> impl ExactSizeIterator<Item = WwiseTriggerBankMapEntry> + 'a {
         self.bytes
-            .chunks_exact(TRIGGER_BANK_RECORD_SIZE)
+            .as_chunks::<TRIGGER_BANK_RECORD_SIZE>()
+            .0
+            .iter()
             .map(|bytes| WwiseTriggerBankMapEntry {
                 bank_id: WwiseBankId(u32::from_le_bytes(
                     bytes[0..4].try_into().expect("four bytes"),

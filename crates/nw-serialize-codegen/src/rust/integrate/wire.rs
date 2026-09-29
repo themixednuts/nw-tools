@@ -229,13 +229,13 @@ pub fn plan(root: &Path, context: &CodegenContext) -> Result<WirePlan, RustInteg
                         if let Some(uuid) = uuid {
                             uuids
                                 .entry(uuid.to_ascii_uppercase())
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push(wire.name.clone());
                         }
                         if let Some(index) = index {
                             indices
                                 .entry(index.clone())
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push(wire.name.clone());
                         }
                     }

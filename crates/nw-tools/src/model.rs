@@ -1028,14 +1028,24 @@ fn encode_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
 /// fails this test.
 fn blue_channel_is_empty(rgba: &[u8]) -> bool {
     const BLUE_EMPTY_MAX: u8 = 4;
-    !rgba.is_empty() && rgba.chunks_exact(4).all(|pixel| pixel[2] <= BLUE_EMPTY_MAX)
+    !rgba.is_empty()
+        && rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[2] <= BLUE_EMPTY_MAX)
 }
 
 /// Rebuild a full RGB normal from a two-channel ddna map: X/Y stay in red/green,
 /// Z is reconstructed per pixel into blue, alpha is cleared to opaque.
 fn ddna_reconstruct_normal(rgba: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; rgba.len()];
-    for (dst, src) in out.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+    for (dst, src) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(rgba.as_chunks::<4>().0.iter())
+    {
         let x = f32::from(src[0]) / 255.0 * 2.0 - 1.0;
         let y = f32::from(src[1]) / 255.0 * 2.0 - 1.0;
         let z = (1.0 - x * x - y * y).max(0.0).sqrt();
@@ -1052,7 +1062,12 @@ fn ddna_reconstruct_normal(rgba: &[u8]) -> Vec<u8> {
 /// alpha opaque.
 fn ddna_gloss_to_roughness(rgba: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; rgba.len()];
-    for (dst, src) in out.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+    for (dst, src) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(rgba.as_chunks::<4>().0.iter())
+    {
         dst[0] = 255;
         dst[1] = 255 - src[3];
         dst[2] = 0;
@@ -1064,7 +1079,7 @@ fn ddna_gloss_to_roughness(rgba: &[u8]) -> Vec<u8> {
 /// Drop a true RGB normal map's alpha, leaving an opaque RGB image.
 fn strip_alpha(rgba: &[u8]) -> Vec<u8> {
     let mut out = rgba.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0.iter_mut() {
         pixel[3] = 255;
     }
     out

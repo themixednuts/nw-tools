@@ -375,6 +375,7 @@ fn emit_standalone_type_module<'a>(
     rustfmt_source(&source)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_integrated_type_module<'a>(
     emit_context: &TypeModuleEmitContext<'_>,
     child_dirs: impl Iterator<Item = &'a str>,

@@ -1176,7 +1176,7 @@ fn decode_pq_log_controller(
 ) -> Result<CafController, CafDecodeError> {
     let mut rotations = Vec::with_capacity(key_count);
     let mut positions = Vec::with_capacity(key_count);
-    for key in keys.chunks_exact(28) {
+    for key in keys.as_chunks::<28>().0.iter() {
         let tick = i32::from_le_bytes(key[0..4].try_into().expect("PQLog key time"));
         let time = tick as f32 / sample_rate - header.start_sec;
         let position = [
@@ -1293,8 +1293,8 @@ fn decode_scalar_times<const N: usize>(
         return Err(CafDecodeError::TruncatedTrack { track: "key time" });
     }
     let mut times = Vec::with_capacity(track.key_count);
-    for chunk in track.data[..expected].chunks_exact(N) {
-        times.push(read(chunk.try_into().expect("chunk size matches const")));
+    for chunk in track.data[..expected].as_chunks::<N>().0.iter() {
+        times.push(read(*chunk));
     }
     Ok(times)
 }
@@ -1321,8 +1321,10 @@ fn decode_bitset_times(track: ControllerTrack<'_>) -> Result<Vec<f32>, CafDecode
     }
     let words = track
         .data
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("word length")))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| u16::from_le_bytes(*bytes))
         .collect::<Vec<_>>();
     let start = words[0] as u32;
     let end = words[1] as u32;
@@ -1372,7 +1374,7 @@ fn decode_positions(track: ControllerTrack<'_>) -> Result<Vec<[f32; 3]>, CafDeco
                 return Err(CafDecodeError::TruncatedTrack { track: "position" });
             }
             let mut positions = Vec::with_capacity(track.key_count);
-            for bytes in track.data[..expected].chunks_exact(12) {
+            for bytes in track.data[..expected].as_chunks::<12>().0.iter() {
                 positions.push([
                     f32_from_le_bytes(bytes[0..4].try_into().expect("x")),
                     f32_from_le_bytes(bytes[4..8].try_into().expect("y")),
