@@ -307,7 +307,9 @@ impl<'a> Datasheet<'a> {
 
         let mut columns = Vec::with_capacity(layout.column_count);
         for (column, record) in slice_at(bytes, layout.columns_offset, layout.columns_len)?
-            .chunks_exact(COLUMN_RECORD_SIZE)
+            .as_chunks::<COLUMN_RECORD_SIZE>()
+            .0
+            .iter()
             .enumerate()
         {
             let crc = le_u32(record);

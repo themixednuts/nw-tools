@@ -1991,6 +1991,65 @@ fn existing_file_matches_hash(
     Ok(hasher.finalize() == expected_hash)
 }
 
+fn reject_compile_errors(compile_unit: &CompileUnit) -> Result<()> {
+    let errors = compile_unit
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    for diagnostic in errors.iter().take(16) {
+        eprintln!("error: {}", diagnostic.message);
+    }
+    if errors.len() > 16 {
+        eprintln!("... {} more error(s)", errors.len() - 16);
+    }
+    bail!("SerializeContext compile emitted errors; refusing to generate source");
+}
+
+fn diagnostic_counts(compile_unit: &CompileUnit) -> (usize, usize) {
+    let errors = compile_unit
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .count();
+    let warnings = compile_unit
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Warning)
+        .count();
+    (errors, warnings)
+}
+
+fn print_catalog_summary(summary: ReflectedTypeCatalogSummary) {
+    println!("reflected types: {}", summary.reflected_types);
+    println!("generic types: {}", summary.generic_types);
+    println!("component descriptors: {}", summary.component_descriptors);
+    println!(
+        "component descriptor name collisions: {}",
+        summary.component_descriptor_name_collisions
+    );
+    println!(
+        "class registration records: {}",
+        summary.class_registration_records
+    );
+    println!(
+        "class registration type IDs: {}",
+        summary.class_registration_type_ids
+    );
+    println!(
+        "class registration duplicate type IDs: {}",
+        summary.class_registration_duplicate_type_ids
+    );
+    println!("faceted components: {}", summary.faceted_components);
+    println!("az components: {}", summary.az_components);
+    println!("client facets: {}", summary.client_facets);
+    println!("server facets: {}", summary.server_facets);
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -2053,63 +2112,4 @@ mod cli_tests {
             "old\n"
         );
     }
-}
-
-fn reject_compile_errors(compile_unit: &CompileUnit) -> Result<()> {
-    let errors = compile_unit
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.severity == Severity::Error)
-        .collect::<Vec<_>>();
-    if errors.is_empty() {
-        return Ok(());
-    }
-
-    for diagnostic in errors.iter().take(16) {
-        eprintln!("error: {}", diagnostic.message);
-    }
-    if errors.len() > 16 {
-        eprintln!("... {} more error(s)", errors.len() - 16);
-    }
-    bail!("SerializeContext compile emitted errors; refusing to generate source");
-}
-
-fn diagnostic_counts(compile_unit: &CompileUnit) -> (usize, usize) {
-    let errors = compile_unit
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.severity == Severity::Error)
-        .count();
-    let warnings = compile_unit
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.severity == Severity::Warning)
-        .count();
-    (errors, warnings)
-}
-
-fn print_catalog_summary(summary: ReflectedTypeCatalogSummary) {
-    println!("reflected types: {}", summary.reflected_types);
-    println!("generic types: {}", summary.generic_types);
-    println!("component descriptors: {}", summary.component_descriptors);
-    println!(
-        "component descriptor name collisions: {}",
-        summary.component_descriptor_name_collisions
-    );
-    println!(
-        "class registration records: {}",
-        summary.class_registration_records
-    );
-    println!(
-        "class registration type IDs: {}",
-        summary.class_registration_type_ids
-    );
-    println!(
-        "class registration duplicate type IDs: {}",
-        summary.class_registration_duplicate_type_ids
-    );
-    println!("faceted components: {}", summary.faceted_components);
-    println!("az components: {}", summary.az_components);
-    println!("client facets: {}", summary.client_facets);
-    println!("server facets: {}", summary.server_facets);
 }

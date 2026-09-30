@@ -1348,8 +1348,8 @@ fn read_f32_array<const N: usize>(
     }
 
     let mut values = [0.0; N];
-    for (slot, bytes) in values.iter_mut().zip(data.chunks_exact(4)) {
-        *slot = f32::from_be_bytes(bytes.try_into().expect("chunks_exact width is four"));
+    for (slot, bytes) in values.iter_mut().zip(data.as_chunks::<4>().0) {
+        *slot = f32::from_be_bytes(*bytes);
     }
     Ok(values)
 }
