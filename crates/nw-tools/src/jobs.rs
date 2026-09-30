@@ -6,8 +6,7 @@ use crate::progress::{Batch, Job, Progress};
 
 #[derive(Debug, Clone, Default, Args)]
 pub struct JobArgs {
-    /// Worker count. Omit for Rayon default; use 0 to run on the caller thread.
-    #[arg(long)]
+    #[arg(from_global)]
     pub jobs: Option<usize>,
 
     /// Disable live progress rendering.

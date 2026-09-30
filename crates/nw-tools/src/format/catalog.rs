@@ -6,8 +6,8 @@ use clap::{Args, Subcommand};
 use humansize::{DECIMAL, format_size};
 
 use crate::jobs::JobArgs;
-use crate::support::{MatchMode, collect_matching, write_guarded};
 use crate::ui::{Cell, Report, Table};
+use nw_tools::support::{MatchMode, collect_matching, write_guarded};
 
 use super::common::{csv_cell, finish_scan, lowered, path_label, text_matches};
 

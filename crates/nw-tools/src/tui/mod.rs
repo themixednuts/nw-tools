@@ -17,7 +17,8 @@ pub use crate::dds::{AlphaSurface, DdsFrame, DdsItem};
 use app::View;
 use datasheet::DatasheetView;
 pub use datasheet::{
-    GridCell, GridColumn, GridType, IndexProgress, Loc, LocaleState, SheetData, SheetSource,
+    ContentSearchResult, GridCell, GridColumn, GridType, IndexProgress, Loc, LocaleState,
+    SheetData, SheetSource,
 };
 use dds::DdsBrowser;
 pub use dds::{DdsCatalog, PakIndex, SharedIndex, TextureStore, shared_index};

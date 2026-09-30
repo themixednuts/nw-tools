@@ -11,3 +11,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+sevenz-rust2 = "0.22"

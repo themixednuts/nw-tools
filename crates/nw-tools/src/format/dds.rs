@@ -8,8 +8,8 @@ use humansize::{DECIMAL, format_size};
 use nw_pak::PakMmapReader;
 
 use crate::jobs::{JobArgs, RunCtx};
-use crate::support::{PakSet, collect_matching, write_guarded};
 use crate::ui::{Cell, Report, Table};
+use nw_tools::support::{PakSet, collect_matching, write_guarded};
 
 use super::common::{finish_scan, path_label, strip_suffix_ignore_ascii_case};
 
@@ -288,7 +288,7 @@ impl Dds {
         }
         scans.sort_by(|left, right| left.source.cmp(&right.source));
 
-        let shown = crate::support::limit_count(scans.len(), self.show);
+        let shown = nw_tools::support::limit_count(scans.len(), self.show);
         let mut report = Report::new("dds")
             .stat("files", scans.len())
             .stat("shown", shown);
@@ -362,7 +362,7 @@ impl Dds {
                 .print();
             return Ok(());
         }
-        let shown = crate::support::limit_count(items.len(), self.show);
+        let shown = nw_tools::support::limit_count(items.len(), self.show);
         let mut report = Report::new("dds")
             .stat("install", &source)
             .stat("textures", items.len())

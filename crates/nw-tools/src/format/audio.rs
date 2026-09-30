@@ -6,8 +6,8 @@ use std::str;
 use anyhow::{Context, Result, bail};
 use clap::Args;
 
-use crate::support::{ensure_parent, guard_existing};
 use crate::ui::{Cell, OutputFormat, Report, Table, print};
+use nw_tools::support::{ensure_parent, guard_existing};
 
 #[derive(Debug, Args)]
 pub struct Audio {

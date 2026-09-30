@@ -81,6 +81,9 @@ pub struct SheetData {
     pub has_localization: bool,
 }
 
+/// A background content-search result: `(generation, sheet hits best-score-first)`.
+pub type ContentSearchResult = (u64, Vec<(u32, u16)>);
+
 /// A location of a value within the workspace.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Loc {
@@ -139,6 +142,20 @@ pub trait SheetSource: Send + Sync {
     /// background discovery sweep so the picker can stream.
     fn sheets(&self) -> Vec<(String, u64)> {
         Vec::new()
+    }
+    /// Start a background fuzzy search over indexed sheet contents (column
+    /// names and all cell values); returns a generation id. The query runs
+    /// against the complete searchable universe on a worker thread and results
+    /// arrive through [`SheetSource::take_content_results`] — the picker polls
+    /// it on tick, so slow searches never block typing. `0` means unsupported
+    /// (name-only filtering).
+    fn search_contents(&self, _query: String) -> u64 {
+        0
+    }
+    /// Take the latest completed background search, if any. Generations older
+    /// than the picker's current request are stale and must be ignored.
+    fn take_content_results(&self) -> Option<ContentSearchResult> {
+        None
     }
     /// Progress of the background pak-discovery sweep (distinct from the
     /// cross-reference index in [`SheetSource::progress`]).

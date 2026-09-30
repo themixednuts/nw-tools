@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use image::{DynamicImage, RgbaImage};
 
-use crate::support::{ensure_parent, guard_existing};
+use nw_tools::support::{ensure_parent, guard_existing};
 
 pub const DEFAULT_FRAMES_PER_SECOND: u32 = 30;
 

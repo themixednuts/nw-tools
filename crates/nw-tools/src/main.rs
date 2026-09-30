@@ -1,19 +1,18 @@
 mod asset;
 mod audio_export;
 mod azoth;
-mod cache;
 mod dds;
-mod extract;
 mod format;
 mod fuzzy;
+mod grep_cli;
 mod jobs;
 mod model;
 mod model_asset;
+mod mount;
 mod pak;
 mod progress;
 mod rnr_asset;
 mod source;
-mod support;
 mod tui;
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -49,6 +48,22 @@ struct Cli {
     /// Restrict default diagnostics to errors. RUST_LOG can add directives.
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     quiet: bool,
+
+    /// Worker count. Omit for Rayon default; use 0 to run on the caller thread.
+    #[arg(long, global = true)]
+    jobs: Option<usize>,
+
+    /// Replace bundled serialize.json for this process only.
+    #[arg(long, global = true, value_name = "FILE")]
+    serialize: Option<std::path::PathBuf>,
+
+    /// Replace bundled behavior-context (JSON or 7z) for this process only.
+    #[arg(long = "behavior-context", global = true, value_name = "FILE")]
+    behavior_context: Option<std::path::PathBuf>,
+
+    /// Replace bundled module descriptors with every `*.json` in this directory.
+    #[arg(long, global = true, value_name = "DIR")]
+    modules: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -108,6 +123,14 @@ enum Command {
         #[command(subcommand)]
         command: native_port::Cmd,
     },
+    #[command(about = "Search decoded content and filenames, or resolve a CRC32")]
+    Grep(grep_cli::Cmd),
+    #[command(about = "Build the local content index")]
+    Index {
+        /// Skip the confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -130,9 +153,20 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
+    if cli.serialize.is_some() || cli.behavior_context.is_some() || cli.modules.is_some() {
+        nw_tools::resources::install_session(nw_tools::resources::ResourceView::from_overrides(
+            cli.serialize.as_deref(),
+            cli.behavior_context.as_deref(),
+            cli.modules.as_deref(),
+        )?);
+    }
+
     match cli.command {
+        Some(Command::Index { yes }) => run_index(yes, cli.plain, cli.jobs)?,
+        Some(Command::Grep(command)) => command.run()?,
         Some(Command::Azoth { command }) => command.run()?,
         Some(Command::Locate) => {
             let install = nw_locator::Install::locate()?;
@@ -157,5 +191,55 @@ fn main() -> anyhow::Result<()> {
             println!();
         }
     }
+    Ok(())
+}
+
+fn run_index(yes: bool, plain: bool, jobs: Option<usize>) -> anyhow::Result<()> {
+    use std::io::{self, IsTerminal, Write};
+
+    use nw_tools::index::{IndexStatus, build_install, first_build_warning};
+
+    let root = nw_locator::Install::locate()?.assets().to_path_buf();
+    if let Some(index) = nw_tools::index::open_existing()
+        && index.is_complete(&root)
+        && index.has_embedded()
+    {
+        let mut report = Report::new("index");
+        report.kv("status", "current");
+        report.print();
+        return Ok(());
+    }
+
+    if !yes {
+        if plain || !io::stdin().is_terminal() {
+            anyhow::bail!("pass --yes to build the index without a prompt");
+        }
+        eprintln!("{}", first_build_warning());
+        eprint!("Start? [y/N] ");
+        io::stderr().flush()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        if !nw_tools::index::confirm_accepted(&line) {
+            let mut report = Report::new("index");
+            report.kv("status", "cancelled");
+            report.print();
+            return Ok(());
+        }
+    }
+
+    let runner = nw_jobs::JobRunner::from_jobs(jobs)?;
+    let status = build_install(&runner)?;
+    let mut report = Report::new("index");
+    match status {
+        IndexStatus::Complete { paks } => {
+            report.kv("status", "complete").kv("paks", paks.to_string());
+        }
+        IndexStatus::Partial { indexed_paks } => {
+            report
+                .kv("status", "partial")
+                .kv("paks", indexed_paks.to_string());
+        }
+    }
+    report.print();
     Ok(())
 }

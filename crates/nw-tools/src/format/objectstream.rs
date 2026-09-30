@@ -9,11 +9,11 @@ use nw_objectstream::ObjectStreamEncoding;
 use nw_objectstream::lookup::NameLookup;
 
 use crate::jobs::{JobArgs, RunCtx};
-use crate::support::{
+use crate::ui::{Cell, Report, Table};
+use nw_tools::support::{
     MatchMode, PathSelector, collect_matching, contains_ascii_case_insensitive, load_lookup,
     path_ext, write_guarded,
 };
-use crate::ui::{Cell, Report, Table};
 
 use super::common::{EncodingArg, finish_scan, lowered, path_label, trim_cell};
 
@@ -231,7 +231,7 @@ impl ObjectStream {
         }
         scans.sort_by(|left, right| object_source(left).cmp(object_source(right)));
 
-        let shown = crate::support::limit_count(scans.len(), self.files);
+        let shown = nw_tools::support::limit_count(scans.len(), self.files);
         let mut report = Report::new("objectstream")
             .stat("files", scans.len())
             .stat("shown", shown)
@@ -337,7 +337,7 @@ fn scan_objectstream(
     limit: usize,
     lookup: Option<&NameLookup>,
 ) -> Result<Option<ObjectScan>> {
-    let limit = crate::support::limit_count(usize::MAX, limit);
+    let limit = nw_tools::support::limit_count(usize::MAX, limit);
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let Some(bytes) = objectstream_payload(&bytes)
         .with_context(|| format!("decode wrapper for {}", path.display()))?

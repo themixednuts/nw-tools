@@ -11,8 +11,8 @@ use nw_localization::{
 };
 
 use crate::jobs::{JobArgs, RunCtx};
-use crate::support::{collect_matching, ensure_parent, guard_existing};
 use crate::ui::{Cell, Report, Table};
+use nw_tools::support::{collect_matching, ensure_parent, guard_existing};
 
 use super::common::{csv_cell, finish_scan, lowered, path_label, text_matches, trim_cell};
 use super::datasheet_browser::browse_datasheets;
@@ -580,7 +580,7 @@ fn sheet_summary_report(scans: &[SheetScan], limit: usize) -> Report {
         "Type",
     ])
     .right([2, 3, 4, 5, 6, 7]);
-    let shown = crate::support::limit_count(scans.len(), limit);
+    let shown = nw_tools::support::limit_count(scans.len(), limit);
     for scan in scans.iter().take(shown) {
         let summary = &scan.summary;
         table.push([

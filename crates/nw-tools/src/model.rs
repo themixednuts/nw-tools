@@ -18,8 +18,8 @@ use nw_artifact::PackageWriter;
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::source::{self, Install};
-use crate::support::{ScanIssues, collect_matching, ensure_parent, guard_existing, path_ext};
 use crate::ui::Report;
+use nw_tools::support::{ScanIssues, collect_matching, ensure_parent, guard_existing, path_ext};
 
 /// Formats which can own or indirectly select a render model. Structured glTF
 /// exports index these once, then reuse the reverse graph for every model in a

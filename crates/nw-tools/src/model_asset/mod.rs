@@ -39,8 +39,10 @@ use physics::scope_scene_physics;
 use sources::{apply_resolved_dependencies, model_context_assets, resolve_cdf};
 
 static OBJECTSTREAM_LOOKUP: LazyLock<nw_objectstream::lookup::NameLookup> = LazyLock::new(|| {
-    nw_objectstream::lookup::NameLookup::from_serialize_json(nw_resources::SERIALIZE_JSON)
-        .expect("bundled serialize.json must build the ObjectStream name lookup")
+    nw_objectstream::lookup::NameLookup::from_serialize_json(
+        nw_tools::resources::session().serialize(),
+    )
+    .expect("bundled serialize.json must build the ObjectStream name lookup")
 });
 
 pub(crate) struct ResolveOptions<'a> {

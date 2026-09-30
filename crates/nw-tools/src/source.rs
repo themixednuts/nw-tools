@@ -4,7 +4,7 @@
 //! Several commands need the same plumbing — locate the install, open every pak,
 //! build a path → (reader, entry) table of contents, and resolve `MtlName` GUIDs
 //! through the catalog. [`Install`] is that shared backbone; the parsed catalog is
-//! cached on disk and only rebuilt when `Engine.pak` changes (see [`crate::cache`]).
+//! cached on disk and only rebuilt when `Engine.pak` changes (see [`nw_tools::cache`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,9 +15,9 @@ use nw_asset::{AssetCatalog, AssetId, Raoc, Rasc, RascEntry};
 use nw_pak::PakMmapReader;
 use uuid::Uuid;
 
-use crate::cache::Cache;
 use crate::jobs::RunCtx;
-use crate::support::PakSet;
+use nw_tools::cache::Cache;
+use nw_tools::support::PakSet;
 
 /// Locate the New World install, with the standard "not found" guidance.
 ///
@@ -253,8 +253,8 @@ fn load_install_catalog(assets: &Path, runner: &nw_jobs::JobRunner) -> Result<As
     // The leading version forces a rebuild when the cached projection's shape
     // changes, even if Engine.pak itself is unchanged.
     let fingerprint =
-        crate::cache::file_fingerprint(&assets.join("Engine.pak")).map(|fp| format!("v5:{fp}"));
-    let db_path = crate::cache::default_path();
+        nw_tools::cache::file_fingerprint(&assets.join("Engine.pak")).map(|fp| format!("v5:{fp}"));
+    let db_path = nw_tools::cache::default_path();
 
     // Fast path: reuse the cache while Engine.pak is unchanged.
     if let Some(fp) = &fingerprint
@@ -337,14 +337,14 @@ pub fn load_or_build_dependency_index(
 ) -> Result<nw_asset_graph::AssetDependencyIndex> {
     let fingerprint = dependency_index_fingerprint(assets);
     if let Some(fingerprint) = &fingerprint
-        && let Some(edges) = crate::cache::load_dependency_index(fingerprint)
+        && let Some(edges) = nw_tools::cache::load_dependency_index(fingerprint)
     {
         return Ok(nw_asset_graph::AssetDependencyIndex::from_edges(edges));
     }
     let index = nw_asset_graph::AssetDependencyIndex::build_with_runner(source, paths, runner)
         .context("build shared authored-asset dependency index")?;
     if let Some(fingerprint) = &fingerprint
-        && let Err(error) = crate::cache::store_dependency_index(fingerprint, index.edges())
+        && let Err(error) = nw_tools::cache::store_dependency_index(fingerprint, index.edges())
     {
         tracing::debug!("dependency index cache store failed: {error:#}");
     }

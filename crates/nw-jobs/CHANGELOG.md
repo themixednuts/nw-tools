@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `JobRunner::from_jobs(Some(n))` sizes the global Rayon pool instead of
+  opening a private one, so `--jobs` and background work share one bound.
+
 ## [0.1.0](https://github.com/themixednuts/nw-tools/releases/tag/nw-jobs-v0.1.0) - 2026-06-21
 
 ### Changed

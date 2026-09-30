@@ -11,9 +11,9 @@ use nw_localization::{
 };
 use nw_pak::PakMmapReader;
 
-use crate::support::{PakSet, collect_matching};
 use crate::tui::SheetSource;
 use crate::ui::Report;
+use nw_tools::support::{PakSet, collect_matching};
 
 use super::common::path_label;
 
@@ -81,7 +81,11 @@ struct DatasheetWorkspace {
     scanned: AtomicUsize,
     discover_total: usize,
     discover_done: AtomicBool,
-    index: Mutex<HashMap<String, Vec<crate::tui::Loc>>>,
+    index: Mutex<HashMap<Arc<str>, Vec<crate::tui::Loc>>>,
+    /// Column name → sheets containing it. The background content search
+    /// consults this alongside `index`, so columns are covered at full recall
+    /// without sampling them into per-sheet blurbs.
+    column_sheets: Mutex<HashMap<Arc<str>, Vec<u32>>>,
     indexed: AtomicUsize,
     index_done: AtomicBool,
     cancel: AtomicBool,
@@ -92,6 +96,11 @@ struct DatasheetWorkspace {
     locale: Mutex<LocaleSlot>,
     /// Bumped whenever resolved localization changes; the viewer watches this.
     loc_gen: AtomicU64,
+    /// Next background content-search generation (0 means none requested).
+    search_seq: AtomicU64,
+    /// Latest completed background search. Only the newest generation is kept;
+    /// the picker discards anything stale.
+    search_done: Mutex<Option<crate::tui::ContentSearchResult>>,
     /// True while a background localization load is in flight (drives the
     /// "loading" indicator and serializes ensures).
     loc_ensuring: AtomicBool,
@@ -128,6 +137,7 @@ impl DatasheetWorkspace {
             discover_total,
             discover_done: AtomicBool::new(discover_done),
             index: Mutex::new(HashMap::new()),
+            column_sheets: Mutex::new(HashMap::new()),
             indexed: AtomicUsize::new(0),
             index_done: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
@@ -138,6 +148,8 @@ impl DatasheetWorkspace {
                 error: None,
             }),
             loc_gen: AtomicU64::new(0),
+            search_seq: AtomicU64::new(0),
+            search_done: Mutex::new(None),
             loc_ensuring: AtomicBool::new(false),
             langs: Mutex::new(HashMap::new()),
             key_index: Mutex::new(None),
@@ -185,6 +197,18 @@ impl DatasheetWorkspace {
 
     fn len(&self) -> usize {
         self.sheet_lock().sources.len()
+    }
+
+    /// Post one background search's sheet hits. Only the newest generation is
+    /// kept; older workers still run to completion but their results are dropped.
+    fn post_search(&self, generation: u64, hits: Vec<(u32, u16)>) {
+        let mut slot = self
+            .search_done
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if generation >= slot.as_ref().map(|(held, _)| *held).unwrap_or(0) {
+            *slot = Some((generation, hits));
+        }
     }
 
     /// Available language codes known so far (non-blocking). Empty until the
@@ -497,6 +521,21 @@ impl crate::tui::SheetSource for DatasheetWorkspace {
         }
     }
 
+    fn search_contents(&self, query: String) -> u64 {
+        let generation = self.search_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(this) = self.me.upgrade() {
+            std::thread::spawn(move || run_content_search(this, generation, query));
+        }
+        generation
+    }
+
+    fn take_content_results(&self) -> Option<crate::tui::ContentSearchResult> {
+        self.search_done
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+
     fn sheets(&self) -> Vec<(String, u64)> {
         let sheets = self.sheet_lock();
         sheets
@@ -617,8 +656,8 @@ fn is_localization_entry(name: &str) -> bool {
     ends_ci(name, ".loc.xml") || ends_ci(name, ".loc") || ends_ci(name, "localization.xml")
 }
 
-/// Index one sheet's string cells into the cross-reference map. Runs on a worker
-/// thread.
+/// Index one sheet's string cells into the cross-reference map, and record
+/// its column names for content search. Runs on a worker thread.
 fn index_sheet(workspace: &DatasheetWorkspace, id: usize) {
     if !workspace.cancel.load(Ordering::Relaxed)
         && let Some(bytes) = workspace.read_bytes(id)
@@ -647,11 +686,96 @@ fn index_sheet(workspace: &DatasheetWorkspace, id: usize) {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             for (value, loc) in local {
-                index.entry(value).or_default().push(loc);
+                match index.get_mut(value.as_str()) {
+                    Some(list) => list.push(loc),
+                    None => {
+                        index.insert(Arc::from(value), vec![loc]);
+                    }
+                }
+            }
+        }
+        // Column names feed the same content search through their own map, so
+        // the value index stays exactly cell values (goto-definition semantics
+        // unchanged). Each sheet is indexed once, so inserts are unchecked;
+        // merge-side dedupe makes a repeated name harmless.
+        let sheet = id as u32;
+        let mut columns = workspace
+            .column_sheets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for column in doc.columns() {
+            let name = column.name();
+            if name.is_empty() {
+                continue;
+            }
+            match columns.get_mut(name) {
+                Some(sheets) => sheets.push(sheet),
+                None => {
+                    columns.insert(Arc::from(name), vec![sheet]);
+                }
             }
         }
     }
     workspace.indexed.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Matched index terms mapped back to sheets per background search. Bounds
+/// the index fan-out: the best terms already carry the best sheets.
+const SEARCH_TOP_TERMS: usize = 256;
+
+/// Run one background content search: fuzzy-match `query` against the complete
+/// searchable universe (every distinct cell value plus every column name),
+/// map the best terms back to sheets, and post the hits (best score first,
+/// sheet id breaking ties). Terms are snapshotted as refcounts under one brief
+/// lock; mapping takes a second one. Runs to completion even when stale — the
+/// picker applies only the newest generation — so slow searches over a huge
+/// universe never block typing.
+fn run_content_search(workspace: Arc<DatasheetWorkspace>, generation: u64, query: String) {
+    let terms: Vec<Arc<str>> = {
+        let index = workspace
+            .index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let columns = workspace
+            .column_sheets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        index.keys().chain(columns.keys()).map(Arc::clone).collect()
+    };
+    let mut term_hits = crate::fuzzy::rank(&query, &terms);
+    term_hits.truncate(SEARCH_TOP_TERMS);
+    let mut best: HashMap<u32, u16> = HashMap::new();
+    if !term_hits.is_empty() {
+        let index = workspace
+            .index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let columns = workspace
+            .column_sheets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut note = |sheet: u32, score: u16| {
+            best.entry(sheet)
+                .and_modify(|held| *held = (*held).max(score))
+                .or_insert(score);
+        };
+        for (term, score) in &term_hits {
+            let key: &str = &terms[*term];
+            if let Some(locs) = index.get(key) {
+                for loc in locs {
+                    note(loc.sheet, *score);
+                }
+            }
+            if let Some(sheets) = columns.get(key) {
+                for &sheet in sheets {
+                    note(sheet, *score);
+                }
+            }
+        }
+    }
+    let mut hits: Vec<(u32, u16)> = best.into_iter().collect();
+    hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    workspace.post_search(generation, hits);
 }
 
 /// Open the datasheet grid TUI. With an explicit `path` the workspace is the

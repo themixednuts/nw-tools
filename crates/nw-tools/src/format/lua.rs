@@ -11,8 +11,8 @@ use nw_lua::{
 };
 
 use crate::jobs::{JobArgs, RunCtx};
-use crate::support::{collect_matching, ensure_parent, guard_existing, write_guarded};
 use crate::ui::{Cell, Report, Table};
+use nw_tools::support::{collect_matching, ensure_parent, guard_existing, write_guarded};
 
 use super::common::{finish_scan, path_label, strip_suffix_ignore_ascii_case};
 
@@ -251,7 +251,7 @@ fn decompile_one(
 fn write_lua_text(path: &Path, text: &str, overwrite: bool) -> Result<()> {
     guard_existing(path, overwrite.into())?;
     ensure_parent(path)?;
-    write_guarded(path, text.as_bytes(), crate::support::Overwrite::Replace)
+    write_guarded(path, text.as_bytes(), nw_tools::support::Overwrite::Replace)
 }
 
 fn render_file(path: &Path, render: LuaRender<'_>) -> Result<String> {

@@ -40,10 +40,83 @@ pub struct Meta {
     pub value: String,
 }
 
+/// Interned searchable text. Field names, values, pak names, and entry
+/// paths all share this dictionary — the only table that stores UTF-8.
+#[SQLiteTable]
+pub struct IdxToken {
+    #[column(primary, autoincrement)]
+    pub id: i64,
+    pub text: String,
+    pub crc: i64,
+    pub crc_lower: i64,
+}
+
+/// One pak archive entry (file) in the content index.
+#[SQLiteTable]
+pub struct IdxEntry {
+    #[column(primary, autoincrement)]
+    pub id: i64,
+    #[column(references = IdxToken::id)]
+    pub pak_id: i64,
+    #[column(references = IdxToken::id)]
+    pub name_id: i64,
+    pub format: i64,
+    pub size: i64,
+}
+
+/// One `(field, value)` occurrence inside an entry. Location is
+/// `(kind, loc_a, loc_b)` so reconstructed phrases are never stored.
+#[SQLiteTable]
+pub struct IdxFact {
+    #[column(primary, autoincrement)]
+    pub id: i64,
+    #[column(references = IdxEntry::id)]
+    pub entry_id: i64,
+    #[column(references = IdxToken::id)]
+    pub field_id: i64,
+    #[column(references = IdxToken::id)]
+    pub value_id: i64,
+    pub kind: i64,
+    pub loc_a: i64,
+    pub loc_b: i64,
+}
+
+/// Per-pak resume record so a side-thread build can continue next run.
+#[SQLiteTable]
+pub struct IdxPak {
+    #[column(primary, autoincrement)]
+    pub id: i64,
+    #[column(references = IdxToken::id)]
+    pub name_id: i64,
+    pub size: i64,
+    pub mtime: i64,
+    pub complete: i64,
+}
+
+#[SQLiteIndex]
+pub struct TokenCrcIdx(IdxToken::crc);
+
+#[SQLiteIndex]
+pub struct TokenCrcLowerIdx(IdxToken::crc_lower);
+
+#[SQLiteIndex]
+pub struct FactValueIdx(IdxFact::value_id);
+
+#[SQLiteIndex]
+pub struct FactFieldIdx(IdxFact::field_id);
+
 #[derive(SQLiteSchema)]
 pub struct Schema {
     pub catalog: Catalog,
     pub meta: Meta,
+    pub idx_token: IdxToken,
+    pub idx_entry: IdxEntry,
+    pub idx_fact: IdxFact,
+    pub idx_pak: IdxPak,
+    pub token_crc_idx: TokenCrcIdx,
+    pub token_crc_lower_idx: TokenCrcLowerIdx,
+    pub fact_value_idx: FactValueIdx,
+    pub fact_field_idx: FactFieldIdx,
 }
 
 const FINGERPRINT_KEY: &str = "engine_pak_fingerprint";
@@ -51,7 +124,7 @@ const RASC_VERSION_KEY: &str = "rasc_version";
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-trait CacheFutureExt: Future + Sized {
+pub(crate) trait CacheFutureExt: Future + Sized {
     fn wait(self) -> Self::Output {
         futures_lite::future::block_on(self)
     }
@@ -68,6 +141,7 @@ const CATALOG_CHUNK: usize = 4_000;
 pub struct Cache {
     local_database: az_turso::LocalDatabase,
     db: Drizzle<Schema>,
+    path: String,
 }
 
 impl Cache {
@@ -93,9 +167,22 @@ impl Cache {
     /// # Errors
     ///
     /// Returns an error if the database cannot be created or a migration fails.
-    #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
         Self::migrated(":memory:")
+    }
+
+    /// On-disk path, or `:memory:`.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn db(&self) -> &Drizzle<Schema> {
+        &self.db
+    }
+
+    pub(crate) fn db_mut(&mut self) -> &mut Drizzle<Schema> {
+        &mut self.db
     }
 
     fn migrated(path: &str) -> anyhow::Result<Self> {
@@ -110,7 +197,11 @@ impl Cache {
             let runtime_connection = local_database.new_connection(BUSY_TIMEOUT)?;
             let (db, _) = Drizzle::new(runtime_connection, Schema::new());
             configure_cache_connection(&db).await?;
-            Ok(Self { local_database, db })
+            Ok(Self {
+                local_database,
+                db,
+                path: path.to_owned(),
+            })
         }
         .wait()
     }
@@ -132,7 +223,7 @@ impl Cache {
     /// Returns an error if the cache is incomplete or contains malformed IDs,
     /// types, sizes, or version metadata.
     pub fn catalog(&self) -> anyhow::Result<nw_asset::AssetCatalog> {
-        let Schema { catalog, meta } = Schema::new();
+        let Schema { catalog, meta, .. } = Schema::new();
         let meta: Vec<SelectMeta> = self.db.select(()).from(meta).all().wait()?;
         let version = meta
             .into_iter()
@@ -169,7 +260,7 @@ impl Cache {
         fingerprint: &str,
         asset_catalog: &nw_asset::AssetCatalog,
     ) -> drizzle::Result<()> {
-        let Schema { catalog, meta } = Schema::new();
+        let Schema { catalog, meta, .. } = Schema::new();
         self.db
             .transaction(SQLiteTransactionType::Deferred, async |tx| {
                 // Rebuild in place instead of replacing the database file. SQLite may

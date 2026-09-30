@@ -314,7 +314,7 @@ struct ThumbCache {
 
 impl ThumbCache {
     fn open() -> Self {
-        let dir = crate::cache::default_path()
+        let dir = nw_tools::cache::default_path()
             .parent()
             .map(|parent| parent.join("thumbnails"));
         if let Some(dir) = dir.clone() {

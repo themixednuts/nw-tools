@@ -39,6 +39,11 @@ impl Crc32 {
     }
 
     #[must_use]
+    pub fn from_str(value: &str) -> Self {
+        Self(crc32fast::hash(value.as_bytes()))
+    }
+
+    #[must_use]
     pub fn from_str_lower(value: &str) -> Self {
         let mut hasher = crc32fast::Hasher::new();
         for byte in value.bytes() {

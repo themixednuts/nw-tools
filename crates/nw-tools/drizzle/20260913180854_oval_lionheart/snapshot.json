@@ -1,0 +1,528 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "id": "b07cd1a5-7038-4ef2-8778-bab2e35e51f1",
+  "prevIds": [
+    "c57cda6d-74aa-4a64-8860-a136e92cb279"
+  ],
+  "ddl": [
+    {
+      "entityType": "tables",
+      "name": "catalog"
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "asset_id",
+      "type": "TEXT",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "path",
+      "type": "TEXT",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "asset_type",
+      "type": "TEXT",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "size",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "catalog",
+      "name": "catalog_pk",
+      "columns": [
+        "asset_id"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "tables",
+      "name": "meta"
+    },
+    {
+      "entityType": "columns",
+      "table": "meta",
+      "name": "key",
+      "type": "TEXT",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "meta",
+      "name": "value",
+      "type": "TEXT",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "meta",
+      "name": "meta_pk",
+      "columns": [
+        "key"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "tables",
+      "name": "idx_token"
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_token",
+      "name": "id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_token",
+      "name": "text",
+      "type": "TEXT",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_token",
+      "name": "crc",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_token",
+      "name": "crc_lower",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "idx_token",
+      "name": "idx_token_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "tables",
+      "name": "idx_entry"
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_entry",
+      "name": "id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_entry",
+      "name": "pak_id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "fks",
+      "table": "idx_entry",
+      "name": "fk_idx_entry_pak_id_idx_token_id_fk",
+      "columns": [
+        "pak_id"
+      ],
+      "tableTo": "idx_token",
+      "columnsTo": [
+        "id"
+      ],
+      "onDelete": null,
+      "onUpdate": null,
+      "nameExplicit": false
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_entry",
+      "name": "name_id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "fks",
+      "table": "idx_entry",
+      "name": "fk_idx_entry_name_id_idx_token_id_fk",
+      "columns": [
+        "name_id"
+      ],
+      "tableTo": "idx_token",
+      "columnsTo": [
+        "id"
+      ],
+      "onDelete": null,
+      "onUpdate": null,
+      "nameExplicit": false
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_entry",
+      "name": "format",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_entry",
+      "name": "size",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "idx_entry",
+      "name": "idx_entry_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "tables",
+      "name": "idx_fact"
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_fact",
+      "name": "id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_fact",
+      "name": "entry_id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "fks",
+      "table": "idx_fact",
+      "name": "fk_idx_fact_entry_id_idx_entry_id_fk",
+      "columns": [
+        "entry_id"
+      ],
+      "tableTo": "idx_entry",
+      "columnsTo": [
+        "id"
+      ],
+      "onDelete": null,
+      "onUpdate": null,
+      "nameExplicit": false
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_fact",
+      "name": "field_id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "fks",
+      "table": "idx_fact",
+      "name": "fk_idx_fact_field_id_idx_token_id_fk",
+      "columns": [
+        "field_id"
+      ],
+      "tableTo": "idx_token",
+      "columnsTo": [
+        "id"
+      ],
+      "onDelete": null,
+      "onUpdate": null,
+      "nameExplicit": false
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_fact",
+      "name": "value_id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "fks",
+      "table": "idx_fact",
+      "name": "fk_idx_fact_value_id_idx_token_id_fk",
+      "columns": [
+        "value_id"
+      ],
+      "tableTo": "idx_token",
+      "columnsTo": [
+        "id"
+      ],
+      "onDelete": null,
+      "onUpdate": null,
+      "nameExplicit": false
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_fact",
+      "name": "kind",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_fact",
+      "name": "loc_a",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_fact",
+      "name": "loc_b",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "idx_fact",
+      "name": "idx_fact_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "tables",
+      "name": "idx_pak"
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_pak",
+      "name": "id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_pak",
+      "name": "name_id",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "fks",
+      "table": "idx_pak",
+      "name": "fk_idx_pak_name_id_idx_token_id_fk",
+      "columns": [
+        "name_id"
+      ],
+      "tableTo": "idx_token",
+      "columnsTo": [
+        "id"
+      ],
+      "onDelete": null,
+      "onUpdate": null,
+      "nameExplicit": false
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_pak",
+      "name": "size",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_pak",
+      "name": "mtime",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "idx_pak",
+      "name": "complete",
+      "type": "INTEGER",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "idx_pak",
+      "name": "idx_pak_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "indexes",
+      "table": "idx_token",
+      "name": "token_crc_idx",
+      "columns": [
+        {
+          "value": "crc",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "origin": "manual"
+    },
+    {
+      "entityType": "indexes",
+      "table": "idx_token",
+      "name": "token_crc_lower_idx",
+      "columns": [
+        {
+          "value": "crc_lower",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "origin": "manual"
+    },
+    {
+      "entityType": "indexes",
+      "table": "idx_fact",
+      "name": "fact_value_idx",
+      "columns": [
+        {
+          "value": "value_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "origin": "manual"
+    },
+    {
+      "entityType": "indexes",
+      "table": "idx_fact",
+      "name": "fact_field_idx",
+      "columns": [
+        {
+          "value": "field_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "origin": "manual"
+    }
+  ],
+  "renames": []
+}

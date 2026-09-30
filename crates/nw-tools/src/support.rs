@@ -226,7 +226,7 @@ pub fn load_lookup(disabled: bool) -> Result<Option<NameLookup>> {
         return Ok(None);
     }
     Ok(Some(NameLookup::from_serialize_json(
-        nw_resources::SERIALIZE_JSON,
+        crate::resources::session().serialize(),
     )?))
 }
 

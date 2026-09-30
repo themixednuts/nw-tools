@@ -14,6 +14,7 @@ workspace = true
 anyhow.workspace = true
 az-physics-assets.workspace = true
 az-turso.workspace = true
+blake3.workspace = true
 clap.workspace = true
 cry-animation.workspace = true
 cry-audio.workspace = true
@@ -42,6 +43,7 @@ nw-localization.workspace = true
 nw-objectstream = { workspace = true, features = ["oodle"] }
 nw-pak = { workspace = true, features = ["oodle"] }
 nw-resources.workspace = true
+quick-xml.workspace = true
 nw-reflected-types.workspace = true
 nw-rnr.workspace = true
 nw-scene.workspace = true
@@ -64,6 +66,7 @@ base64 = "0.22.1"
 uuid.workspace = true
 drizzle = { git = "https://github.com/themixednuts/drizzle-rs", rev = "a64799e7fe92361e24c7c79be1b944bf78fcb19a", features = [
   "turso",
+  "query",
 ] }
 futures-lite = "2"
 tempfile.workspace = true

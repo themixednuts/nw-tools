@@ -1,6 +1,48 @@
+use std::io::Cursor;
+use std::sync::OnceLock;
+
 pub const SERIALIZE_JSON: &[u8] = include_bytes!("../../../resources/serialize.json");
 pub const TYPEREGISTRY_JSON: &[u8] = include_bytes!("../../../resources/typeregistry.json");
+pub const BEHAVIOR_CONTEXT_7Z: &[u8] = include_bytes!("../../../resources/behavior-context.7z");
 pub const STEAM_API64_DLL: &[u8] = include_bytes!("../../../resources/steam_api64.dll");
+
+/// Decompressed `behavior-context.json` from the statically linked archive.
+#[must_use]
+pub fn behavior_context_json() -> &'static [u8] {
+    static DECODED: OnceLock<Vec<u8>> = OnceLock::new();
+    DECODED.get_or_init(|| {
+        decompress_behavior_context(BEHAVIOR_CONTEXT_7Z).unwrap_or_else(|_| b"{}".to_vec())
+    })
+}
+
+/// Unpack a behavior-context 7z (bundled or a session override).
+///
+/// # Errors
+///
+/// Returns an error if the archive cannot be read or has no files.
+pub fn decompress_behavior_context(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive =
+        sevenz_rust2::ArchiveReader::new(Cursor::new(bytes), sevenz_rust2::Password::empty())
+            .map_err(|error| error.to_string())?;
+    archive.set_thread_count(1);
+    let mut found = None;
+    archive
+        .for_each_entries(|entry, reader| {
+            if entry.is_directory() {
+                return Ok(true);
+            }
+            let name = entry.name().replace('\\', "/");
+            if name.ends_with("behavior-context.json") || found.is_none() {
+                let mut out = Vec::new();
+                std::io::copy(reader, &mut out)?;
+                found = Some(out);
+                return Ok(!name.ends_with("behavior-context.json"));
+            }
+            Ok(true)
+        })
+        .map_err(|error| error.to_string())?;
+    found.ok_or_else(|| "behavior-context.7z has no files".to_string())
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct EmbeddedResource {
@@ -174,8 +216,28 @@ pub fn all() -> impl Iterator<Item = EmbeddedResource> {
             bytes: TYPEREGISTRY_JSON,
         },
         EmbeddedResource {
+            path: "behavior-context.7z",
+            bytes: BEHAVIOR_CONTEXT_7Z,
+        },
+        EmbeddedResource {
             path: "steam_api64.dll",
             bytes: STEAM_API64_DLL,
+        },
+    ]
+    .into_iter()
+    .chain(module_descriptors())
+}
+
+/// Searchable reflection dumps: serialize, decoded behavior-context, modules.
+pub fn reflection_dumps() -> impl Iterator<Item = EmbeddedResource> {
+    [
+        EmbeddedResource {
+            path: "serialize.json",
+            bytes: SERIALIZE_JSON,
+        },
+        EmbeddedResource {
+            path: "behavior-context.json",
+            bytes: behavior_context_json(),
         },
     ]
     .into_iter()

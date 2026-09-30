@@ -11,8 +11,9 @@ use frizbee::{Config, Matcher, match_list};
 
 /// Fuzzy-rank `haystacks` against `query`, returning the index of each matching
 /// entry paired with its score, best match first. Non-matches are dropped. An
-/// empty query keeps every entry in its original order.
-pub fn rank(query: &str, haystacks: &[String]) -> Vec<(usize, u16)> {
+/// empty query keeps every entry in its original order. Generic over string-like
+/// haystacks so background search can score shared text without cloning it.
+pub fn rank<S: AsRef<str>>(query: &str, haystacks: &[S]) -> Vec<(usize, u16)> {
     if query.is_empty() {
         return (0..haystacks.len()).map(|index| (index, 0)).collect();
     }

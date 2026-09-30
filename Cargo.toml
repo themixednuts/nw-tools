@@ -20,6 +20,10 @@ style = { level = "warn" }
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
+# Keep index builds and database-backed tests practical in debug builds.
+[profile.dev.package.turso_core]
+opt-level = 2
+
 [profile.dist]
 inherits = "release"
 lto = "fat"

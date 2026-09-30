@@ -148,17 +148,23 @@ impl JobRunner {
     /// Build a runner from an optional worker count.
     ///
     /// `None` uses the global Rayon pool, `Some(0)` runs on the caller thread,
-    /// and any other value creates a private worker pool.
+    /// and any other value sizes that same global pool. The first successful
+    /// size wins; later calls keep sharing the pool that already exists.
+    /// [`Self::with_workers`] is the isolated-pool constructor.
     ///
     /// # Errors
     ///
-    /// Returns [`JobRunnerBuildError`] if Rayon cannot create the requested
-    /// private worker pool.
+    /// Kept for source compatibility. This constructor does not fail.
     pub fn from_jobs(jobs: Option<usize>) -> Result<Self, JobRunnerBuildError> {
         match jobs {
             None => Ok(Self::automatic()),
             Some(0) => Ok(Self::inline()),
-            Some(workers) => Self::with_workers(workers),
+            Some(workers) => {
+                let _ = ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build_global();
+                Ok(Self::automatic())
+            }
         }
     }
 
@@ -702,6 +708,14 @@ mod tests {
     fn explicit_zero_jobs_is_inline() {
         let runner = JobRunner::from_jobs(Some(0)).unwrap();
         assert!(runner.is_inline());
+    }
+
+    #[test]
+    fn nonzero_jobs_share_the_global_pool() {
+        let automatic = JobRunner::automatic();
+        let bounded = JobRunner::from_jobs(Some(2)).unwrap();
+        assert_eq!(bounded.policy(), JobRunnerPolicy::Automatic);
+        assert_eq!(bounded.parallelism(), automatic.parallelism());
     }
 
     #[test]

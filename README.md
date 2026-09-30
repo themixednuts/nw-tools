@@ -16,6 +16,33 @@ nw-tools --help
 
 Use `--help` on any subcommand for details.
 
+## Content search and CRC lookup
+
+```powershell
+nw-tools grep IronSword --exact
+nw-tools grep --crc 0xF835A8F0 --target value --case original
+nw-tools grep --crc 123456789 --target field
+nw-tools --format json grep --root E:\Game\Assets --crc 0x12345678 --target name
+```
+
+CRC input accepts decimal or `0x` hexadecimal. Field lookup defaults to original
+bytes; value and filename lookup default to ASCII lowercase. Results include all
+candidate strings and their occurrences, so CRC collisions remain visible.
+
+Text queries use fuzzy matching by default and combine multiple terms with OR.
+Use `--name-only` or `--content-only` to limit them. `--format json` includes the
+full matched value, field, location, and score.
+
+Queries use an existing index when it covers the requested root, otherwise they
+extract live. Both include bundled reflection dumps and process-local overrides.
+Use `--live` to force extraction or `--index DB` to select an existing database.
+Only `nw-tools index --yes` builds the index. Changed paks are rebuilt separately;
+skipped content keeps coverage partial, and interrupted paks are replaced on retry.
+An older extraction version requires an explicit rebuild.
+
+`cargo run -p nw-tools --example time_crc` measures fixture writes and successful
+and missing CRC lookups. Add `-- --embedded` to include bundled reflection dumps.
+
 ## Cry model and character export
 
 `format model` converts standalone or PAK-mounted `.cgf`, `.skin`, `.chr`,

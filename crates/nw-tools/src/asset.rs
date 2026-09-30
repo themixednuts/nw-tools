@@ -10,15 +10,15 @@ use nw_objectstream::lookup::NameLookup;
 use nw_objectstream::{ObjectStream, ObjectStreamEncoding};
 use nw_pak::{Compression, EntryInfo, PakMmapReader, azcs, crypak, shape};
 
-use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
+use crate::mount::{MountedPath, PathClaims};
 use crate::progress::Job;
 use crate::source;
-use crate::support::{
+use crate::ui::{Cell, Report, Table, theme};
+use nw_tools::support::{
     AssetRootArg, GlobSet, MatchMode, PakSet, PathSelector, ScanIssues,
     contains_ascii_case_insensitive, guard_existing, load_lookup,
 };
-use crate::ui::{Cell, Report, Table, theme};
 
 const DEFAULT_MAX_ENTRY_SIZE: u64 = 128 * 1024 * 1024;
 
@@ -630,7 +630,7 @@ impl SearchPath {
             rows.sort();
         }
         let matched = rows.len();
-        rows.truncate(crate::support::limit_count(rows.len(), self.show));
+        rows.truncate(nw_tools::support::limit_count(rows.len(), self.show));
 
         let stats = vec![
             ("archives".to_string(), paks.paths().len().to_string()),
@@ -820,7 +820,7 @@ impl Dependencies {
             .collect::<Vec<_>>();
         mappings.sort_unstable();
         let mut table = Table::new(["Required", "Relation", "Source", "Target", "Status"]);
-        let shown = crate::support::limit_count(mappings.len(), self.show);
+        let shown = nw_tools::support::limit_count(mappings.len(), self.show);
         for (source, relation, required, target, status) in mappings.iter().take(shown) {
             table.push([
                 Cell::text(if *required { "yes" } else { "no" }),
@@ -999,7 +999,7 @@ impl SearchObjectStream {
                 .then(left.value.cmp(&right.value))
         });
         let matched = rows.len();
-        rows.truncate(crate::support::limit_count(rows.len(), self.show));
+        rows.truncate(nw_tools::support::limit_count(rows.len(), self.show));
 
         let stats = vec![
             ("archives".to_string(), paks.paths().len().to_string()),
@@ -1469,7 +1469,7 @@ impl SummaryReport {
         }
 
         let mut report = Report::with_stats("asset summary", stats);
-        let shown_count = crate::support::limit_count(rows.len(), limit);
+        let shown_count = nw_tools::support::limit_count(rows.len(), limit);
         let shown = &rows[..shown_count];
         report.table_or(summary_table(shown), "no entries");
         if self.stats.len() > shown_count {
