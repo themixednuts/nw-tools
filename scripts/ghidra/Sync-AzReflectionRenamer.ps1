@@ -17,13 +17,14 @@ if ((Test-Path -LiteralPath $bundlePath) -and !$Force -and !$DryRun) {
 }
 
 $imports = [ordered] @{}
-$body = [System.Collections.Generic.List[string]]::new()
+$sources = [ordered] @{}
 foreach ($name in @('AzReflectionRenamer.java', 'GhidraCli.java')) {
     $sourceText = Get-Content -LiteralPath (Join-Path $SourceDir $name) -Raw
     if ([string]::IsNullOrWhiteSpace($sourceText) -or !$sourceText.TrimEnd().EndsWith('}')) {
         throw "Source is empty or incomplete: $name. Installed scripts were not changed."
     }
-    foreach ($line in $sourceText -split '\r?\n') {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $sourceText.TrimEnd() -split '\r?\n') {
         if ($line -match '^\s*import\s+.+;\s*$') {
             $imports[$line.Trim()] = $true
         }
@@ -31,10 +32,29 @@ foreach ($name in @('AzReflectionRenamer.java', 'GhidraCli.java')) {
             continue
         }
         else {
-            $body.Add($line)
+            $lines.Add($line)
         }
     }
+    $sources[$name] = $lines
 }
+
+# Ghidra compiles each script in the directory into a shared bundle and keeps only the classes
+# named for a script file; with another script beside it, a second top-level GhidraCli is dropped
+# and the run fails with NoClassDefFoundError. Nested classes travel with their script.
+$helper = $sources['GhidraCli.java']
+$declaration = $helper.FindIndex([Predicate[string]] { param($line) $line -match '^final class GhidraCli\s*\{' })
+if ($declaration -lt 0) {
+    throw "GhidraCli.java no longer declares 'final class GhidraCli'. Installed scripts were not changed."
+}
+$body = [System.Collections.Generic.List[string]]::new()
+$renamer = $sources['AzReflectionRenamer.java']
+$body.AddRange($renamer.GetRange(0, $renamer.Count - 1))
+$body.Add('')
+for ($i = $declaration; $i -lt $helper.Count; $i++) {
+    $line = if ($i -eq $declaration) { $helper[$i] -replace '^final class', 'static final class' } else { $helper[$i] }
+    $body.Add($(if ($line.Length -gt 0) { '    ' + $line } else { $line }))
+}
+$body.Add($renamer[$renamer.Count - 1])
 if ($DryRun) {
     Write-Output "Dry run: would bundle reflection importer into $bundlePath and remove its obsolete wrappers"
     return
