@@ -1,16 +1,21 @@
-// Rename AZ reflection evidence from resources/serialize.json and optional sibling modules.
+// Import names, datatypes and layouts from AZ reflection resources.
 //@category NewWorld
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileReader;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.io.Writer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -35,6 +40,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonWriter;
 
 import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
 import org.apache.commons.compress.archivers.sevenz.SevenZFile;
@@ -42,11 +48,15 @@ import org.apache.commons.compress.archivers.sevenz.SevenZFile;
 import docking.widgets.filechooser.GhidraFileChooser;
 import docking.widgets.filechooser.GhidraFileChooserMode;
 import ghidra.app.script.GhidraScript;
+import ghidra.app.services.ProgramManager;
+import ghidra.framework.model.DomainFile;
+import ghidra.framework.model.DomainFolder;
+import ghidra.program.model.listing.Program;
+import ghidra.app.util.SymbolPathParser;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.ArrayDataType;
 import ghidra.program.model.data.BooleanDataType;
 import ghidra.program.model.data.ByteDataType;
-import ghidra.program.model.data.Category;
 import ghidra.program.model.data.CategoryPath;
 import ghidra.program.model.data.CharDataType;
 import ghidra.program.model.data.DataType;
@@ -55,12 +65,15 @@ import ghidra.program.model.data.DataTypeConflictHandler;
 import ghidra.program.model.data.DataTypeManager;
 import ghidra.program.model.data.DoubleDataType;
 import ghidra.program.model.data.FloatDataType;
+import ghidra.program.model.data.EnumDataType;
 import ghidra.program.model.data.IntegerDataType;
 import ghidra.program.model.data.LongLongDataType;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.ShortDataType;
 import ghidra.program.model.data.Structure;
 import ghidra.program.model.data.StructureDataType;
+import ghidra.program.model.data.TypedefDataType;
+import ghidra.program.model.data.UnionDataType;
 import ghidra.program.model.data.Undefined1DataType;
 import ghidra.program.model.data.UnsignedIntegerDataType;
 import ghidra.program.model.data.UnsignedLongLongDataType;
@@ -78,8 +91,14 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.listing.ParameterImpl;
+import ghidra.program.model.listing.AutoParameterType;
+import ghidra.program.model.listing.ReturnParameterImpl;
+import ghidra.program.model.listing.Variable;
+import ghidra.program.model.listing.VariableStorage;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.lang.Register;
+import ghidra.program.model.pcode.PcodeOp;
+import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.Reference;
@@ -92,18 +111,20 @@ import ghidra.program.model.symbol.SymbolType;
 import ghidra.util.exception.CancelledException;
 
 public class AzReflectionRenamer extends GhidraScript {
-    private static final String SCRIPT_VERSION = "1.0.0";
+    private static final String SCRIPT_VERSION = "1.6.9";
     private static final Pattern MODULE_ADDR_RE =
         Pattern.compile("^(?<module>[^+]+)\\+0x(?<offset>[0-9a-fA-F]+)$");
     private static final Pattern HEX_ADDR_RE =
         Pattern.compile("^0x(?<addr>[0-9a-fA-F]+)$");
     private static final Pattern BAD_NAME_CHARS_RE =
-        Pattern.compile("[^A-Za-z0-9_:<>,~]");
+        Pattern.compile("[^A-Za-z0-9_:<>,~*&()\\[\\]=!+\\-/%|^.?]");
+    private static final Pattern ANGLE_OPERATOR_RE =
+        Pattern.compile("\\boperator\\s*(<=>|<<=?|>>=?|<=|>=|<|>)");
     private static final Pattern UNDERSCORES_RE = Pattern.compile("_+");
     private static final Pattern UUID_RE = Pattern.compile(
         "(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
     private static final Pattern MB_GET_TYPE_NAME_SIGNATURE_RE = Pattern.compile(
-        "const char \\*__cdecl MB::GetTypeName<class (?<type>[^>]+)>\\(void\\)");
+        "const char \\*__cdecl MB::GetTypeName<(?:class |struct |enum )?(?<type>[^\\r\\n]+)>\\(void\\)");
     private static final int MAX_REF_DEPTH = 64;
     private static final int MAX_TEMPLATE_VALUE_DEPTH = 16;
     private static final int MAX_SUMMARY_ACTION_EXAMPLES = 8;
@@ -178,6 +199,7 @@ public class AzReflectionRenamer extends GhidraScript {
     private SymbolTable symbols;
     private DataTypeManager dataTypeManager;
     private Map<String, Structure> declaredStructuresByTypeId = Collections.emptyMap();
+    private final Map<String, Structure> previewCoreDatatypes = new HashMap<>();
     private Gson gson;
     private boolean applyRenames;
     private File inputFile;
@@ -188,7 +210,7 @@ public class AzReflectionRenamer extends GhidraScript {
     private BehaviorContextEvidence behaviorContextEvidence;
     private TypeEvidenceIndex typeEvidence;
     private Map<String, JsonObject> jsonObjectsById;
-    private Map<String, ArrayList<Address>> definedStringAddressesByValue;
+    private ReflectionStrings reflectionStrings;
     private Set<String> labelSeen;
     private Map<String, String> targetNameOwners;
     private Map<String, Address> pointerReadCache;
@@ -200,16 +222,68 @@ public class AzReflectionRenamer extends GhidraScript {
     private String currentModuleSource;
     private String currentModuleName;
     private Set<String> ambiguousModuleComponentNames;
+    private final Set<String> reflectedClassScopePaths = new HashSet<>();
+    private final Set<String> reflectedNamespaceScopePaths = new HashSet<>();
+    private final Set<String> unparsedTypeNames = new TreeSet<>();
+    private Map<String, JsonObject> datatypeGenerics = Collections.emptyMap();
+    private Map<String, String> datatypeNames = Collections.emptyMap();
+    private final Map<String, String> enumUnderlyingTypes = new LinkedHashMap<>();
+    private boolean nativeLayoutProfile;
+    private final Set<String> datatypeConflictingPaths = new HashSet<>();
+    private final Set<Namespace> templateScopeCandidates = new LinkedHashSet<>();
+    private static final Set<String> ENGINE_NAMESPACE_ROOTS = Set.of("AZ", "AZStd", "std", "MB", "Javelin");
     private GhidraCli cli;
     private boolean forceOutput;
     private boolean dryRun;
+    private final ArrayList<JsonArraySpool> temporarySpools = new ArrayList<>();
+    private java.nio.file.Path spoolDirectory;
+    private java.nio.file.Path programProjectDirectory;
+    private long programProjectReserve;
+    private static final long INITIAL_STORAGE_RESERVE = 4L * 1024 * 1024 * 1024;
+    private static final long RUNNING_STORAGE_RESERVE = 512L * 1024 * 1024;
+    private Map<String, PendingComment> pendingComments;
+    private JsonObject validationReport;
+    private File validationFile;
+    private boolean validating;
+    private int validationErrors;
+    private String currentPhase;
+    private static final int MAX_VALIDATION_ERROR_SAMPLES = 100;
+    private final Map<String, Integer> rejectedCodePointers = new LinkedHashMap<>();
     private static final Map<String, String> MODULE_NAMES_BY_VTABLE = moduleNamesByVtable();
 
     @Override
     protected void run() throws Exception {
+        try {
+            runImport();
+        }
+        catch (ReportStorageException error) {
+            end(false);
+            recordRunFailure("storage-failed", error);
+            println("Reflection import stopped; this run's program edits were rolled back.");
+            println(error.getMessage());
+            println("The previous report was preserved. Correct the storage problem before rerunning.");
+        }
+        catch (CancelledException error) {
+            end(false);
+            recordRunFailure("cancelled", error);
+            throw error;
+        }
+        catch (Exception error) {
+            end(false);
+            recordRunFailure("failed", error);
+            throw error;
+        }
+        finally {
+            pendingComments = null;
+            closeTemporarySpools();
+        }
+    }
+
+    private void runImport() throws Exception {
         cli = GhidraCli.parse(
             getScriptArgs(),
             Set.of(
+                "resources",
                 "serialize-json",
                 "out",
                 "module-evidence",
@@ -226,16 +300,14 @@ public class AzReflectionRenamer extends GhidraScript {
             println("AzReflectionRenamer " + SCRIPT_VERSION);
             return;
         }
-        forceOutput = cli.flag("force", null, false);
+        forceOutput = cli.flag("force", null, true);
         dryRun = cli.flag("dry-run", null, false);
-        if (currentProgram == null) {
-            popup("No current program is open.");
-            return;
-        }
+        if (!requireOpenProgram()) return;
 
         symbols = currentProgram.getSymbolTable();
         dataTypeManager = currentProgram.getDataTypeManager();
         gson = new GsonBuilder().setPrettyPrinting().create();
+        pendingComments = new LinkedHashMap<>();
         labelSeen = new HashSet<>();
         targetNameOwners = new HashMap<>();
         pointerReadCache = new HashMap<>();
@@ -244,88 +316,83 @@ public class AzReflectionRenamer extends GhidraScript {
         calledFunctionsCache = new HashMap<>();
         instanceVtableCandidatesCache = new HashMap<>();
         moduleInstanceVtableAddresses = new HashSet<>();
-        definedStringAddressesByValue = null;
+        reflectionStrings = null;
         ambiguousModuleComponentNames = new TreeSet<>();
+        validationReport = null;
 
         inputFile = chooseInputFile();
-        moduleEvidence = loadModuleEvidence(inputFile);
-        classRegistrationEvidence = loadClassRegistrationEvidence(inputFile);
-        fieldRegistrationEvidence = loadFieldRegistrationEvidence(inputFile);
-        applyRenames = chooseApplyRenames();
+        boolean requestedApply = chooseApplyRenames();
+        applyRenames = false;
         outputFile = chooseOutputFile(inputFile);
-        if (outputFile.exists() && !forceOutput && !dryRun) {
+        if (outputFile.exists() && !forceOutput && requestedApply) {
             throw new IllegalArgumentException(
                 "output already exists: " + outputFile + "; pass --force to replace it");
         }
+        initializeValidationReport(requestedApply);
+        prepareReportStorage();
+        currentPhase = "reading-modules-and-registration";
+        monitor.setMessage("Reading module reflection");
+        moduleEvidence = loadModuleEvidence(inputFile);
+        classRegistrationEvidence = loadClassRegistrationEvidence(inputFile);
+        fieldRegistrationEvidence = loadFieldRegistrationEvidence(inputFile);
+        currentPhase = "reading-behavior-context";
+        monitor.setMessage("Reading BehaviorContext reflection");
         behaviorContextEvidence = loadBehaviorContextEvidence(inputFile);
-
-        JsonElement root;
-        try (FileReader reader = new FileReader(inputFile)) {
-            root = JsonParser.parseReader(reader);
+        monitor.checkCancelled();
+        currentPhase = "reading-serialize-context";
+        JsonElement root = readSerializeContext(inputFile);
+        if (!inputFile.isFile() && behaviorContextEvidence.input == null && moduleEvidence.inputs.isEmpty()) {
+            throw new IllegalArgumentException("No supported reflection captures found in " + inputFile.getParent());
         }
-        if (root == null || !root.isJsonObject()) {
-            popup("No SerializeContext object found in " + inputFile);
+        if (behaviorContextEvidence.skippedInputs > 0 || moduleEvidence.skippedInputs > 0 ||
+            classRegistrationEvidence.skippedInputs > 0 || classRegistrationEvidence.malformedRecords > 0 ||
+            fieldRegistrationEvidence.skippedInputs > 0 || fieldRegistrationEvidence.malformedRecords > 0) {
+            throw new IOException("Reflection inputs could not be read: " +
+                behaviorContextEvidence.skippedReasons + " " + moduleEvidence.skippedReasons + " " +
+                classRegistrationEvidence.skippedReasons + " " + fieldRegistrationEvidence.skippedReasons);
+        }
+        monitor.setMessage("Indexing reflection type identities");
+        currentPhase = "indexing-type-identities";
+        ScanResult scan = scanSerializeContext(root);
+        reconcileBehaviorTypeScopes(scan.classData);
+        enrichFieldRegistrationEvidence();
+        println("Validating reflection and proposed layouts before program edits...");
+        ActionSink previewActions = new ActionSink(false);
+        validating = true;
+        try {
+            runReflectionPass(root, scan, previewActions, true);
+        }
+        finally { validating = false; }
+        finishValidationReport(scan, previewActions);
+        writeValidationReport();
+        if (validationErrors > 0) {
+            println("Validation found " + validationErrors + " errors. No program changes were applied. " +
+                "See " + validationFile.getAbsolutePath());
             return;
         }
-
-        ScanResult scan = scanSerializeContext(root);
-        enrichFieldRegistrationEvidence();
-        Map<String, SlotGroup> rttiSlotGroups =
-            rttiSlotGroups(scan.rttiTypes.values(), SERIALIZE_RTTI_SLOT_NAMES);
-        Map<String, SlotGroup> callbackGroups = callbackGroups(scan.classData);
-        Map<String, SlotGroup> classRegistrationGroups = classRegistrationFunctionGroups();
-        ClassRegistrationFunctionIndex classFunctionIndex =
-            classRegistrationFunctionIndex(classRegistrationEvidence);
+        if (!requestedApply) {
+            println("Dry run complete. No program changes were applied. Report: " + validationFile.getAbsolutePath());
+            return;
+        }
+        resetReflectionPassState();
+        applyRenames = true;
         boolean includeFullActions = includeFullActionReport();
-        Set<String> functionSeen = new HashSet<>();
-        Set<String> aliasSeen = new HashSet<>();
         ActionSink actions = new ActionSink(includeFullActions);
-        ensureCoreReflectionDatatypes(actions);
-        processCoreRttiCastHelpers(functionSeen, actions);
-
-        for (RttiType type : scan.rttiTypes.values()) {
-            processRttiType(
-                type,
-                SERIALIZE_RTTI_SLOT_NAMES,
-                rttiSlotGroups,
-                functionSeen,
-                aliasSeen,
-                actions);
-            if (monitor.isCancelled()) {
-                break;
-            }
-        }
-
-        for (ClassData classData : scan.classData) {
-            processClassData(classData, callbackGroups, functionSeen, aliasSeen, actions);
-            if (monitor.isCancelled()) {
-                break;
-            }
-        }
-        processReflectedDatatypes(scan.classData, actions);
-        processClassRegistrationTraces(
-            classRegistrationGroups,
-            classFunctionIndex,
-            functionSeen,
-            aliasSeen,
-            actions);
-        processFieldRegistrationTraces(functionSeen, actions);
-        processModuleDescriptorRenames(actions);
-        processInferredStaticRttiHelperVtables(functionSeen, aliasSeen, actions);
-        processBehaviorContextEvidence(
-            behaviorContextEvidence,
-            functionSeen,
-            aliasSeen,
-            actions);
-        processMbGetTypeNameFunctions(functionSeen, actions);
-        processStaticReflectFunctionParameters(scan.classData, actions);
-        cleanupRepeatedFunctionNamespaces(actions);
+        JsonObject containerReport = runReflectionPass(root, scan, actions, false);
 
         ActionStats stats = actions.stats;
 
         JsonObject report = new JsonObject();
         report.addProperty("input", inputFile.getAbsolutePath());
-        report.addProperty("mode", "ghidra-java");
+        report.addProperty("mode", "unified-reflection");
+        report.addProperty("scriptVersion", SCRIPT_VERSION);
+        report.addProperty("reportFormatVersion", 2);
+        report.addProperty("validationReport", validationFile.getAbsolutePath());
+        report.addProperty("resources", inputFile.getParentFile().getAbsolutePath());
+        report.addProperty("serializeContextLoaded", inputFile.isFile());
+        report.addProperty("typeRegistry", "excluded");
+        report.addProperty("nativeLayoutProfile", nativeLayoutProfile ? "NewWorld 3-26 x64" : "unmatched; reflection fields only");
+        report.add("reflectedTypes", reflectedTypesReport(scan.classData));
         report.addProperty("requestedRenames", applyRenames);
         report.addProperty("applyRenames", applyRenames);
         report.addProperty("dryRun", dryRun);
@@ -351,6 +418,8 @@ public class AzReflectionRenamer extends GhidraScript {
         report.add("behaviorContextEvidence",
             behaviorContextEvidenceReport(behaviorContextEvidence));
         report.add("typeEvidence", typeEvidenceReport(typeEvidence));
+        report.add("unparsedTypeNames", stringArray(unparsedTypeNames));
+        report.add("containers", containerReport);
         report.add("actionKindCounts", mapToJson(stats.kindCounts));
         report.add("actionReasonCounts", mapToJson(stats.reasonCounts));
         report.add("actionSamples", actions.actionSamples());
@@ -368,85 +437,952 @@ public class AzReflectionRenamer extends GhidraScript {
         report.add(
             "unresolvedTypeNameCollisionTypeIds",
             stringSetMapToJson(scan.unresolvedCollidingTypeIdsByName));
-        if (includeFullActions) {
-            report.add("actions", actions.fullActions());
-        }
-
-        if (dryRun) {
-            println("Dry run: would write rename report to " + outputFile.getAbsolutePath());
-        }
-        else {
-            try (FileWriter writer = new FileWriter(outputFile)) {
-                gson.toJson(report, writer);
-            }
-        }
+        currentPhase = "writing-applied-report";
+        writeRenameReport(report, actions);
 
         String summary = buildSummary(scan, actions, stats);
         println(summary);
     }
 
-    private File chooseInputFile() throws Exception {
-        String explicit = optionValue("serialize-json", "AZOTH_SERIALIZE_JSON");
-        if (explicit != null) {
-            return new File(explicit);
+    private JsonObject runReflectionPass(JsonElement root, ScanResult scan, ActionSink actions, boolean preview)
+        throws Exception {
+        Map<String, SlotGroup> rttiGroups = rttiSlotGroups(scan.rttiTypes.values(), SERIALIZE_RTTI_SLOT_NAMES);
+        Map<String, SlotGroup> callbacks = callbackGroups(scan.classData);
+        Set<String> functionSeen = new HashSet<>();
+        Set<String> aliasSeen = new HashSet<>();
+        runReflectionPhase("core-reflection", preview, () -> {
+            ensureCoreReflectionDatatypes(actions);
+        });
+        runReflectionPhase("datatypes-and-layouts", preview, () ->
+            declaredStructuresByTypeId = processReflectedDatatypes(scan.classData, actions));
+        runReflectionPhase("serialize-rtti", preview, () -> {
+            processCoreRttiCastHelpers(functionSeen, actions);
+            monitor.initialize(scan.rttiTypes.size());
+            for (RttiType type : scan.rttiTypes.values()) {
+                monitor.setMessage("RTTI names: " + type.targetTypeName);
+                processRttiType(type, SERIALIZE_RTTI_SLOT_NAMES, rttiGroups, functionSeen, aliasSeen, actions);
+                monitor.incrementProgress(1);
+                monitor.checkCancelled();
+            }
+        });
+        runReflectionPhase("serialize-callbacks", preview, () -> {
+            monitor.initialize(scan.classData.size());
+            for (ClassData data : scan.classData) {
+                monitor.setMessage("Serialized callbacks: " + data.targetTypeName);
+                processClassData(data, callbacks, functionSeen, aliasSeen, actions);
+                monitor.incrementProgress(1);
+                monitor.checkCancelled();
+            }
+            processSerializeFactoryVtables(scan.classData, actions);
+            processMemberFunctionThisParameters(scan.classData, declaredStructuresByTypeId, actions);
+        });
+        JsonObject containerReport = new JsonObject();
+        runReflectionPhase("serialization-containers", preview, () -> {
+            JsonObject result = processSerializeContainers(root, actions);
+            for (var entry : result.entrySet()) containerReport.add(entry.getKey(), entry.getValue());
+        });
+        runReflectionPhase("registration-traces", preview, () -> {
+            processClassRegistrationTraces(classRegistrationFunctionGroups(),
+                classRegistrationFunctionIndex(classRegistrationEvidence), functionSeen, aliasSeen, actions);
+            processFieldRegistrationTraces(functionSeen, actions);
+        });
+        runReflectionPhase("module-descriptors", preview, () -> processModuleDescriptorRenames(actions));
+        runReflectionPhase("inferred-static-rtti", preview,
+            () -> processInferredStaticRttiHelperVtables(functionSeen, aliasSeen, actions));
+        runReflectionPhase("behavior-context-apis-and-buses", preview,
+            () -> processBehaviorContextEvidence(behaviorContextEvidence, functionSeen, aliasSeen, actions));
+        runReflectionPhase("mb-names-and-reflection-signatures", preview, () -> {
+            processMbGetTypeNameFunctions(functionSeen, actions);
+            processStaticReflectFunctionParameters(scan.classData, actions);
+        });
+        runReflectionPhase("namespace-cleanup-and-comments", preview, () -> {
+            cleanupRepeatedFunctionNamespaces(actions);
+            flushPendingComments();
+        });
+        return containerReport;
+    }
+
+    @FunctionalInterface
+    private interface ReflectionPhase { void run() throws Exception; }
+
+    private void runReflectionPhase(String name, boolean preview, ReflectionPhase operation) throws Exception {
+        currentPhase = name;
+        monitor.setMessage((preview ? "Validating: " : "Applying: ") + name);
+        monitor.checkCancelled();
+        JsonObject phase = new JsonObject();
+        phase.addProperty("name", name);
+        int errorsBefore = validationErrors;
+        long started = System.nanoTime();
+        try {
+            operation.run();
+            monitor.checkCancelled();
         }
-        return chooseInputFileViaPicker();
+        catch (CancelledException | ReportStorageException error) { throw error; }
+        catch (Exception error) {
+            if (!preview) throw error;
+            recordValidationError(error, null);
+        }
+        finally {
+            if (preview) {
+                phase.addProperty("status", validationErrors == errorsBefore ? "passed" : "failed");
+                phase.addProperty("errorCount", validationErrors - errorsBefore);
+                phase.addProperty("elapsedMillis", (System.nanoTime() - started) / 1_000_000);
+                validationReport.getAsJsonArray("phases").add(phase);
+            }
+        }
+    }
+
+    private void resetReflectionPassState() {
+        pendingComments.clear();
+        labelSeen.clear();
+        targetNameOwners.clear();
+        scopeCache.clear();
+        calledFunctionsCache.clear();
+        instanceVtableCandidatesCache.clear();
+        moduleInstanceVtableAddresses.clear();
+        ambiguousModuleComponentNames.clear();
+        datatypeConflictingPaths.clear();
+        templateScopeCandidates.clear();
+        declaredStructuresByTypeId = Collections.emptyMap();
+        previewCoreDatatypes.clear();
+    }
+
+    private void initializeValidationReport(boolean requestedApply) {
+        String name = outputFile.getName();
+        int extension = name.lastIndexOf('.');
+        String stem = extension > 0 ? name.substring(0, extension) : name;
+        if (stem.equals("reflection-report")) stem = "reflection";
+        validationFile = new File(outputFile.getAbsoluteFile().getParentFile(), stem + "-dry-run.json");
+        validationErrors = 0;
+        rejectedCodePointers.clear();
+        validationReport = new JsonObject();
+        validationReport.addProperty("scriptVersion", SCRIPT_VERSION);
+        validationReport.addProperty("mode", "reflection-validation");
+        validationReport.addProperty("program", currentProgram.getName());
+        validationReport.addProperty("imageBase", currentProgram.getImageBase().toString());
+        validationReport.addProperty("input", inputFile.getAbsolutePath());
+        validationReport.addProperty("typeRegistry", "excluded");
+        validationReport.addProperty("requestedApply", requestedApply);
+        validationReport.addProperty("programEditsDuringValidation", false);
+        validationReport.addProperty("coverage", "Read-only evidence analysis, proposed layouts and function signature/storage plans. " +
+            "Database writes and apply-only operations run after validation and can still fail.");
+        validationReport.addProperty("status", "reading-inputs");
+        validationReport.add("phases", new JsonArray());
+        validationReport.add("errors", new JsonArray());
+    }
+
+    private void finishValidationReport(ScanResult scan, ActionSink actions) {
+        validationReport.addProperty("status", validationErrors == 0 ? "passed" : "failed");
+        validationReport.addProperty("errorCount", validationErrors);
+        validationReport.addProperty("errorSamplesOmitted",
+            Math.max(0, validationErrors - MAX_VALIDATION_ERROR_SAMPLES));
+        validationReport.addProperty("nativeLayoutProfile", nativeLayoutProfile);
+        validationReport.addProperty("rttiTypeCount", scan.rttiTypes.size());
+        validationReport.addProperty("classDataCount", scan.classData.size());
+        validationReport.addProperty("moduleDescriptorCount", moduleEvidence.descriptorCount);
+        validationReport.addProperty("behaviorClassCount", behaviorContextEvidence.classCount);
+        validationReport.addProperty("behaviorEbusCount", behaviorContextEvidence.ebusCount);
+        validationReport.addProperty("behaviorEbusEventCount", behaviorContextEvidence.ebusEventCount);
+        validationReport.addProperty("actionCount", actions.size());
+        validationReport.addProperty("wouldApplyCount", actions.stats.wouldApplyCount);
+        validationReport.addProperty("appliedCount", actions.stats.appliedCount);
+        validationReport.add("actionKindCounts", mapToJson(actions.stats.kindCounts));
+        validationReport.add("actionReasonCounts", mapToJson(actions.stats.reasonCounts));
+        validationReport.add("actionSamples", actions.actionSamples());
+        validationReport.addProperty("checkedSignatureCount", actions.stats.checkedSignatureCount);
+        validationReport.add("signatureReasonCounts", mapToJson(actions.stats.signatureReasonCounts));
+        validationReport.add("signaturePlanSamples", actions.signatureSamples);
+        validationReport.add("rejectedNativeCodePointers", mapToJson(rejectedCodePointers));
+        validationReport.add("unparsedTypeNames", stringArray(unparsedTypeNames));
+    }
+
+    private void recordValidationError(Exception error, JsonObject evidence) {
+        validationErrors++;
+        if (validationReport == null || validationReport.getAsJsonArray("errors").size() >= MAX_VALIDATION_ERROR_SAMPLES) return;
+        JsonObject item = new JsonObject();
+        item.addProperty("phase", currentPhase);
+        item.addProperty("exception", error.getClass().getName());
+        item.addProperty("message", error.getMessage());
+        JsonArray stack = new JsonArray();
+        for (StackTraceElement frame : error.getStackTrace()) {
+            if (stack.size() == 40) break;
+            stack.add(frame.toString());
+        }
+        item.add("stackTrace", stack);
+        if (error.getCause() != null) item.addProperty("cause", error.getCause().toString());
+        if (evidence != null) item.add("action", actionSample(evidence));
+        validationReport.getAsJsonArray("errors").add(item);
+    }
+
+    private void recordRunFailure(String status, Exception error) {
+        if (validationReport == null) return;
+        if (!(error instanceof ReflectionActionException)) recordValidationError(error, null);
+        validationReport.addProperty("status", status);
+        validationReport.addProperty("failurePass", applyRenames ? "apply" : "validation");
+        validationReport.addProperty("errorCount", validationErrors);
+        try { writeValidationReport(); }
+        catch (Exception reportError) { println("Cannot save validation diagnostics: " + reportError.getMessage()); }
+    }
+
+    private void recordValidationActionError(JsonObject action, JsonObject detail) {
+        validationErrors++;
+        JsonArray errors = validationReport.getAsJsonArray("errors");
+        if (errors.size() >= MAX_VALIDATION_ERROR_SAMPLES) return;
+        JsonObject item = new JsonObject();
+        item.addProperty("phase", currentPhase);
+        item.addProperty("kind", "action-error");
+        item.addProperty("message", stringMember(detail, "error"));
+        copyActionProperty(detail, item, "errorType");
+        item.add("action", actionSample(action));
+        if (detail != action) item.add("field", detail);
+        errors.add(item);
+    }
+
+    private static class ReflectionActionException extends IllegalStateException {
+        ReflectionActionException(JsonObject action) {
+            super("Reflection action failed: " + action.get("kind") + " " + action.get("name") +
+                " at " + action.get("address") + ": " + action.get("error"));
+        }
+    }
+
+    private void writeValidationReport() {
+        java.nio.file.Path temporary = null;
+        try {
+            java.nio.file.Path parent = validationFile.toPath().toAbsolutePath().getParent();
+            Files.createDirectories(parent);
+            temporary = Files.createTempFile(parent, ".reflection-validation-", ".tmp");
+            try (JsonWriter writer = new JsonWriter(openReportWriter(temporary))) {
+                writer.setIndent("  ");
+                writer.setSerializeNulls(true);
+                writeJsonValue(validationReport, writer, false);
+            }
+            try {
+                Files.move(temporary, validationFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            }
+            catch (java.nio.file.AtomicMoveNotSupportedException error) {
+                Files.move(temporary, validationFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        catch (IOException error) {
+            throw new ReportStorageException("Cannot save reflection validation at " + validationFile, error);
+        }
+        finally {
+            if (temporary != null) {
+                try { Files.deleteIfExists(temporary); }
+                catch (IOException error) { println("Unable to remove temporary validation report " + temporary); }
+            }
+        }
+        println("Dry-run validation report: " + validationFile.getAbsolutePath());
+    }
+
+    private boolean requireOpenProgram() throws Exception {
+        if (currentProgram != null) return true;
+        ProgramManager manager = startupProgramManager();
+        if (manager == null) {
+            println("No CodeBrowser program manager is attached. Open NewWorld 3-26 in CodeBrowser " +
+                "and run the script from that window's Script Manager.");
+            return false;
+        }
+
+        Program selected = manager.getCurrentProgram();
+        boolean ambiguous = false;
+        if (selected == null) {
+            ArrayList<Program> matches = new ArrayList<>();
+            for (Program program : manager.getAllOpenPrograms()) {
+                if (isStartupTarget(program.getName()) ||
+                    (program.getDomainFile() != null && isStartupTarget(program.getDomainFile().getName()))) matches.add(program);
+            }
+            if (matches.size() == 1) selected = matches.get(0);
+            ambiguous = matches.size() > 1;
+        }
+        if (selected == null && !ambiguous && state != null && state.getProject() != null) {
+            ArrayList<DomainFile> matches = new ArrayList<>();
+            collectStartupTargets(state.getProject().getProjectData().getRootFolder(), matches);
+            if (matches.size() == 1) selected = manager.openProgram(matches.get(0));
+        }
+        if (selected != null) {
+            openProgram(selected);
+        }
+        else {
+            Program choice = chooseStartupProgram();
+            if (choice == null) {
+                println("Reflection import stopped before edits. Open or select NewWorld 3-26 in CodeBrowser to continue.");
+                return false;
+            }
+            try { openProgram(choice); }
+            finally { choice.release(this); }
+        }
+        if (currentProgram == null) {
+            println("The selected program could not be activated in this CodeBrowser. Import stopped before edits.");
+            return false;
+        }
+        println("Reflection target: " + currentProgram.getName());
+        return true;
+    }
+
+    protected ProgramManager startupProgramManager() {
+        return state == null || state.getTool() == null ? null : state.getTool().getService(ProgramManager.class);
+    }
+
+    protected Program chooseStartupProgram() throws Exception {
+        if (state == null || state.getTool() == null || isRunningHeadless()) return null;
+        String[] arguments = getScriptArgs();
+        setScriptArgs(new String[0]);
+        try { return askProgram("Select NewWorld 3-26"); }
+        finally { setScriptArgs(arguments); }
+    }
+
+    private boolean isStartupTarget(String name) {
+        return name != null && name.toLowerCase(Locale.ROOT).replaceAll("\\.exe$", "")
+            .replaceAll("[\\s_-]", "").equals("newworld326");
+    }
+
+    private void collectStartupTargets(DomainFolder folder, List<DomainFile> matches) throws CancelledException {
+        monitor.checkCancelled();
+        for (DomainFile file : folder.getFiles()) {
+            if (isStartupTarget(file.getName()) && Program.class.isAssignableFrom(file.getDomainObjectClass())) matches.add(file);
+        }
+        for (DomainFolder child : folder.getFolders()) collectStartupTargets(child, matches);
+    }
+
+    private JsonElement readSerializeContext(File file) throws IOException {
+        if (!file.isFile()) return new JsonObject();
+        try (Reader reader = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8)) {
+            JsonElement root = JsonParser.parseReader(reader);
+            if (root == null || !root.isJsonObject() ||
+                !(root.getAsJsonObject().has("uuidMap") || root.getAsJsonObject().has("classData"))) {
+                throw new IOException("Not a SerializeContext capture: " + file);
+            }
+            return root;
+        }
+    }
+
+    private void writeRenameReport(JsonObject report, ActionSink actions) throws Exception {
+        File parent = outputFile.getAbsoluteFile().getParentFile();
+        Files.createDirectories(parent.toPath());
+        java.nio.file.Path temporary = null;
+        try {
+            temporary = Files.createTempFile(parent.toPath(), ".reflection-report-", ".tmp");
+            try (JsonWriter writer = new JsonWriter(openReportWriter(temporary))) {
+                writer.setIndent("  ");
+                writer.setSerializeNulls(true);
+                writer.beginObject();
+                for (Map.Entry<String, JsonElement> entry : report.entrySet()) {
+                    monitor.checkCancelled();
+                    writer.name(entry.getKey());
+                    if (entry.getKey().equals("behaviorContextEvidence")) {
+                        writer.beginObject();
+                        for (Map.Entry<String, JsonElement> field : entry.getValue().getAsJsonObject().entrySet()) {
+                            writer.name(field.getKey());
+                            writeJsonValue(field.getValue(), writer, false);
+                        }
+                        writer.name("inventory");
+                        writeBehaviorInventory(writer, behaviorContextEvidence);
+                        writer.endObject();
+                    }
+                    else writeJsonValue(entry.getValue(), writer, false);
+                }
+                if (actions.keepsFullActions()) {
+                    writer.name("symbolNameSnapshots");
+                    actions.symbolNameSnapshots.writeTo(writer);
+                    writer.name("actions");
+                    actions.fullActionSpool.writeTo(writer);
+                }
+                writer.endObject();
+            }
+            try {
+                Files.move(temporary, outputFile.toPath(), StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+            }
+            catch (java.nio.file.AtomicMoveNotSupportedException error) {
+                Files.move(temporary, outputFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        catch (IOException error) {
+            throw new ReportStorageException("Cannot write reflection report at " + outputFile.getAbsolutePath(), error);
+        }
+        finally {
+            if (temporary != null) {
+                try { Files.deleteIfExists(temporary); }
+                catch (IOException error) { println("Unable to remove temporary report " + temporary + ": " + error.getMessage()); }
+            }
+        }
+        println("Reflection report: " + outputFile.getAbsolutePath());
+    }
+
+    private void writeBehaviorInventory(JsonWriter writer, BehaviorContextEvidence index)
+        throws IOException, CancelledException {
+        writer.beginObject();
+        writer.name("context"); writeJsonValue(index.contextMetadata, writer, false);
+        writer.name("classes"); index.classInventory.writeTo(writer);
+        writer.name("globalMethods"); index.globalMethodInventory.writeTo(writer);
+        writer.name("globalProperties"); index.globalPropertyInventory.writeTo(writer);
+        writer.name("ebuses"); index.ebusInventory.writeTo(writer);
+        writer.name("typeToClassMap"); writeJsonValue(index.typeToClassInventory, writer, false);
+        writer.name("onDemandReflection"); writeJsonValue(index.onDemandInventory, writer, false);
+        writer.name("constants"); writeJsonValue(index.constantInventory, writer, false);
+        writer.name("functionUses").beginArray();
+        for (BehaviorFunctionCandidate candidate : index.functionCandidates) {
+            monitor.checkCancelled();
+            String name = fullName(candidate.scope, candidate.localName);
+            writer.beginObject().name("name").value(name).name("address").value(candidate.address)
+                .name("kind").value(candidate.kind);
+            if (candidate.ownerTypeId != null) writer.name("ownerTypeId").value(candidate.ownerTypeId);
+            if (candidate.slot != null) writer.name("virtualDispatchSlotOffset").value(candidate.slot);
+            String offset = captureOffset(candidate.address);
+            if (offset != null) writer.name("implementationAlias")
+                .value("AZ::BehaviorContext::Method<" + name + ">::Implementation<0x" + offset + ">");
+            writer.endObject();
+        }
+        writer.endArray().endObject();
+    }
+
+    private void writeJsonValue(JsonElement value, JsonWriter writer, boolean compact) throws IOException {
+        if (value == null || value.isJsonNull()) {
+            writer.nullValue();
+        }
+        else if (value.isJsonArray()) {
+            writer.beginArray();
+            for (JsonElement item : value.getAsJsonArray()) writeJsonValue(item, writer, compact);
+            writer.endArray();
+        }
+        else if (value.isJsonObject()) {
+            writer.beginObject();
+            JsonObject object = value.getAsJsonObject();
+            for (Map.Entry<String, JsonElement> entry : object.entrySet()) {
+                if (compact && isBehaviorAlias(object, entry.getKey(), entry.getValue())) continue;
+                writer.name(entry.getKey());
+                writeJsonValue(entry.getValue(), writer, compact);
+            }
+            writer.endObject();
+        }
+        else if (value.getAsJsonPrimitive().isBoolean()) writer.value(value.getAsBoolean());
+        else if (value.getAsJsonPrimitive().isNumber()) writer.jsonValue(value.getAsString());
+        else writer.value(value.getAsString());
+    }
+
+    private void copyJsonValue(JsonReader reader, JsonWriter writer) throws IOException, CancelledException {
+        monitor.checkCancelled();
+        switch (reader.peek()) {
+            case BEGIN_OBJECT:
+                reader.beginObject(); writer.beginObject();
+                while (reader.hasNext()) {
+                    writer.name(reader.nextName());
+                    copyJsonValue(reader, writer);
+                }
+                reader.endObject(); writer.endObject();
+                break;
+            case BEGIN_ARRAY:
+                reader.beginArray(); writer.beginArray();
+                while (reader.hasNext()) copyJsonValue(reader, writer);
+                reader.endArray(); writer.endArray();
+                break;
+            case NULL:
+                reader.nextNull(); writer.nullValue();
+                break;
+            case NUMBER:
+                writer.jsonValue(reader.nextString());
+                break;
+            case BOOLEAN:
+                writer.value(reader.nextBoolean());
+                break;
+            case STRING:
+                writer.value(reader.nextString());
+                break;
+            default:
+                throw new IOException("Unexpected report token: " + reader.peek());
+        }
+    }
+
+    private class JsonArraySpool implements AutoCloseable {
+        private final boolean compact;
+        private final boolean enabled;
+        private final String purpose;
+        private java.nio.file.Path path;
+        private JsonWriter writer;
+        private boolean finished;
+        private int count;
+
+        JsonArraySpool(boolean compact, boolean enabled) {
+            this(compact, enabled, "inventory");
+        }
+
+        JsonArraySpool(boolean compact, boolean enabled, String purpose) {
+            this.compact = compact;
+            this.enabled = enabled;
+            this.purpose = purpose;
+        }
+
+        void add(JsonElement value) {
+            count++;
+            if (!enabled) return;
+            try {
+                if (finished) throw new IOException("Report spool already finalized");
+                if (writer == null) {
+                    path = Files.createTempFile(reportSpoolDirectory(), purpose + "-", ".json");
+                    path.toFile().deleteOnExit();
+                    temporarySpools.add(this);
+                    writer = new JsonWriter(openReportWriter(path));
+                    writer.setSerializeNulls(true);
+                    writer.beginArray();
+                }
+                writeJsonValue(value, writer, compact);
+            }
+            catch (IOException error) {
+                throw new ReportStorageException("Cannot write reflection evidence at " +
+                    (path == null ? reportStorageParent() : path), error);
+            }
+        }
+
+        int size() { return count; }
+
+        void finish() throws IOException {
+            if (finished) return;
+            finished = true;
+            if (writer != null) {
+                writer.endArray();
+                writer.close();
+                writer = null;
+            }
+        }
+
+        void writeTo(JsonWriter output) throws IOException, CancelledException {
+            finish();
+            if (path == null) { output.beginArray().endArray(); return; }
+            try (JsonReader input = new JsonReader(Files.newBufferedReader(path, StandardCharsets.UTF_8))) {
+                copyJsonValue(input, output);
+            }
+        }
+
+        JsonArray readArray() {
+            try {
+                finish();
+                if (path == null) return new JsonArray();
+                try (Reader input = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                    return JsonParser.parseReader(input).getAsJsonArray();
+                }
+            }
+            catch (IOException error) {
+                throw new java.io.UncheckedIOException(error);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                if (writer != null) {
+                    try { writer.close(); }
+                    catch (IOException ignored) { /* Unfinished scratch JSON is discarded below. */ }
+                }
+            }
+            finally {
+                writer = null;
+                if (path != null) Files.deleteIfExists(path);
+            }
+        }
+    }
+
+    private void closeTemporarySpools() {
+        for (JsonArraySpool spool : temporarySpools) {
+            try { spool.close(); }
+            catch (IOException error) { println("Reflection scratch cleanup at " + spool.path + ": " + error.getMessage()); }
+        }
+        temporarySpools.clear();
+        if (spoolDirectory != null) {
+            try { Files.deleteIfExists(spoolDirectory); }
+            catch (IOException error) { println("Unable to remove reflection scratch directory " + spoolDirectory + ": " + error.getMessage()); }
+            spoolDirectory = null;
+        }
+    }
+
+    private java.nio.file.Path reportStorageParent() {
+        File anchor = outputFile != null ? outputFile : inputFile;
+        return anchor == null ? ghidra.framework.Application.getUserTempDirectory().toPath() :
+            anchor.getAbsoluteFile().getParentFile().toPath();
+    }
+
+    private java.nio.file.Path reportSpoolDirectory() throws IOException {
+        if (spoolDirectory == null) {
+            java.nio.file.Path parent = reportStorageParent();
+            Files.createDirectories(parent);
+            spoolDirectory = Files.createTempDirectory(parent, ".az-reflection-");
+            spoolDirectory.toFile().deleteOnExit();
+        }
+        return spoolDirectory;
+    }
+
+    private void prepareReportStorage() {
+        try {
+            java.nio.file.Path parent = reportStorageParent();
+            Files.createDirectories(parent);
+            if (outputFile.isDirectory()) throw new IOException("Report destination is a directory: " + outputFile);
+            requireStorageSpace(parent, INITIAL_STORAGE_RESERVE);
+            requireStorageSpace(ghidra.framework.Application.getUserTempDirectory().toPath(), INITIAL_STORAGE_RESERVE);
+            var domainFile = currentProgram.getDomainFile();
+            var project = domainFile == null ? null : domainFile.getProjectLocator();
+            if (project != null && project.getProjectDir().isDirectory()) {
+                programProjectDirectory = project.getProjectDir().toPath();
+                programProjectReserve = Math.max(INITIAL_STORAGE_RESERVE, domainFile.length() + RUNNING_STORAGE_RESERVE);
+                requireStorageSpace(programProjectDirectory, programProjectReserve);
+            }
+            java.nio.file.Path probe = Files.createTempFile(parent, ".reflection-write-check-", ".tmp");
+            Files.delete(probe);
+        }
+        catch (IOException error) {
+            throw new ReportStorageException("Reflection storage preflight failed", error);
+        }
+    }
+
+    protected long availableSpace(java.nio.file.Path directory) throws IOException {
+        return Files.getFileStore(directory).getUsableSpace();
+    }
+
+    private void requireStorageSpace(java.nio.file.Path directory, long minimum) throws IOException {
+        long available = availableSpace(directory);
+        if (available < minimum) {
+            throw new IOException(directory + " has " + available / (1024 * 1024) +
+                " MiB free; at least " + minimum / (1024 * 1024) + " MiB is required. " +
+                "Ghidra database temporary directory: " + ghidra.framework.Application.getUserTempDirectory());
+        }
+    }
+
+    protected Writer openReportWriter(java.nio.file.Path path) throws IOException {
+        return new java.io.FilterWriter(Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            private long charactersSinceCheck = 262144;
+
+            private void checkSpace(int length) throws IOException {
+                charactersSinceCheck += length;
+                if (charactersSinceCheck < 262144) return;
+                charactersSinceCheck = 0;
+                requireStorageSpace(path.getParent(), RUNNING_STORAGE_RESERVE);
+                requireStorageSpace(ghidra.framework.Application.getUserTempDirectory().toPath(), RUNNING_STORAGE_RESERVE);
+                if (programProjectDirectory != null) requireStorageSpace(programProjectDirectory, programProjectReserve);
+            }
+
+            @Override public void write(int value) throws IOException {
+                checkSpace(1);
+                out.write(value);
+            }
+
+            @Override public void write(char[] value, int offset, int length) throws IOException {
+                checkSpace(length);
+                out.write(value, offset, length);
+            }
+
+            @Override public void write(String value, int offset, int length) throws IOException {
+                checkSpace(length);
+                out.write(value, offset, length);
+            }
+        };
+    }
+
+    private static class ReportStorageException extends java.io.UncheckedIOException {
+        ReportStorageException(String context, IOException cause) {
+            super(context + ": " + cause.getMessage(), cause);
+        }
+    }
+
+    private File chooseInputFile() throws Exception {
+        String resources = optionValue("resources", "AZOTH_REFLECTION_RESOURCES");
+        String serialize = optionValue("serialize-json", "AZOTH_SERIALIZE_JSON");
+        if (resources != null && serialize != null) {
+            throw new IllegalArgumentException("Choose --resources or --serialize-json.");
+        }
+        if (serialize != null) {
+            File file = new File(serialize).getAbsoluteFile();
+            if (!file.isFile()) throw new IOException("SerializeContext file not found: " + file);
+            rememberInputDirectory(file);
+            return file;
+        }
+        File selected = resources == null ? chooseInputFileViaPicker() : new File(resources);
+        File directory = reflectionResourcesDirectory(selected);
+        rememberInputDirectory(directory);
+        return new File(directory, "serialize.json");
+    }
+
+    private File reflectionResourcesDirectory(File selected) {
+        File absolute = selected.getAbsoluteFile();
+        File directory = absolute.isFile() ? absolute.getParentFile() : absolute;
+        if (!directory.isDirectory()) {
+            throw new IllegalArgumentException("Reflection resources directory not found: " + directory);
+        }
+        File child = new File(directory, "resources");
+        if (child.isDirectory()) return child;
+        for (File parent = directory; parent != null; parent = parent.getParentFile()) {
+            if (parent.getName().equalsIgnoreCase("resources") ||
+                new File(parent, "serialize.json").isFile() ||
+                new File(parent, "behavior-context.json").isFile() ||
+                new File(parent, "behavior-context.json.zip").isFile() ||
+                new File(parent, "behavior-context.7z").isFile() ||
+                new File(parent, "modules").isDirectory()) return parent;
+        }
+        return directory;
+    }
+
+    // NewWorld 3-26's IDataContainer ends before the neighboring GenericClassInfo table.
+    // Unknown flag/operation names stay comments rather than borrowing a different engine ABI.
+    private static final String[] CONTAINER_SLOT_NAMES = {
+        null, "GetElement", "GetElement", "EnumElements", "Size", "Capacity",
+        "IsStableElements", "IsFixedSize", "IsFixedCapacity", "IsSmartPointer",
+        null, null, null, "GetAssociativeContainerInterface", "ReserveElement",
+        "GetElementByIndex", "StoreElement", null, null, "RemoveElement",
+        "RemoveElements", "ClearElements", "ElementsUpdated"
+    };
+
+    private static final String[] CONTAINER_SLOT_DESCRIPTIONS = {
+        "scalar deleting destructor", "GetElement(ClassElement&, const DataElement&)",
+        "GetElement(u32 elementNameCrc)", "EnumElements", "Size", "Capacity",
+        "IsStableElements", "IsFixedSize", "IsFixedCapacity", "IsSmartPointer",
+        "flag; exact source name unresolved", "flag; exact source name unresolved",
+        "flag; exact source name unresolved", "GetAssociativeContainerInterface",
+        "ReserveElement", "GetElementByIndex", "StoreElement",
+        "insertion/movement callback; exact source name unresolved",
+        "element-swap callback; exact source name unresolved", "RemoveElement",
+        "RemoveElements", "ClearElements", "ElementsUpdated"
+    };
+
+    private static class SerializeContainer {
+        String typeId;
+        String typeName;
+        String family;
+        String vtable;
+        JsonObject genericInfo;
+        JsonArray slots;
+        ArrayList<String> scope;
+    }
+
+    private List<SerializeContainer> serializeContainers(JsonElement root) {
+        ArrayList<JsonObject> objects = collectObjects(root);
+        jsonObjectsById = indexObjectsById(objects);
+        Map<String, JsonObject> generics = indexGenericInfo(root, objects, jsonObjectsById);
+        Map<String, String> names = indexRawTypeNames(objects);
+        ArrayList<SerializeContainer> result = new ArrayList<>();
+        for (Map.Entry<String, JsonObject> entry : generics.entrySet()) {
+            JsonObject generic = entry.getValue();
+            JsonObject classData = objectMember(generic, "classData");
+            String family = classData == null ? null : stringMember(classData, "name");
+            if (!Set.of("AZStd::vector", "AZStd::unordered_map", "AZStd::unordered_set").contains(
+                    family == null ? "" : family)) {
+                continue;
+            }
+            JsonObject info = objectMember(classData, "containerInfo");
+            SerializeContainer container = new SerializeContainer();
+            container.typeId = entry.getKey();
+            container.family = family;
+            container.typeName = displayTypeName(entry.getKey(), family, generics, names, new HashSet<>());
+            container.genericInfo = generic;
+            container.vtable = info == null ? null : stringMember(info, "vtable");
+            container.slots = info == null ? null : arrayMember(info, "slots");
+            // ClassData<T> is the script's analysis namespace, not a claim that AZStd objects are virtual.
+            if (container.typeName != null) {
+                container.scope = new ArrayList<>(List.of("AZ", "SerializeContext",
+                    "ClassData<" + safeTypeName(container.typeName) + ">", "container"));
+            }
+            result.add(container);
+        }
+        result.sort((a, b) -> a.typeId.compareTo(b.typeId));
+        return result;
+    }
+
+    private JsonObject processSerializeContainers(JsonElement root, ActionSink actions) throws Exception {
+        JsonObject report = new JsonObject();
+        JsonObject summary = new JsonObject();
+        JsonArray skipped = new JsonArray();
+        List<SerializeContainer> containers = serializeContainers(root);
+        summary.addProperty("specializations", containers.size());
+        report.add("summary", summary);
+        report.add("skipped", skipped);
+        report.addProperty("programName", currentProgram.getName());
+        if (!supportsContainerPointerLayout()) {
+            summary.addProperty("reason", "unsupported-container-ABI; profile requires little-endian 64-bit pointers");
+            return report;
+        }
+        Map<String, ArrayList<String>> functionOwners = new LinkedHashMap<>();
+        Map<String, ArrayList<SerializeContainer>> functionContainers = new LinkedHashMap<>();
+        Map<String, LinkedHashSet<Integer>> functionSlots = new LinkedHashMap<>();
+        Set<String> tables = new HashSet<>();
+        int validated = 0;
+        int resolved = 0;
+        for (SerializeContainer container : containers) {
+            monitor.checkCancelled();
+            String failure = validateContainerTable(container);
+            if (failure != null) {
+                JsonObject skip = new JsonObject();
+                skip.addProperty("typeId", container.typeId);
+                skip.addProperty("vtable", container.vtable);
+                skip.addProperty("reason", failure);
+                skipped.add(skip);
+                continue;
+            }
+            validated++;
+            tables.add(container.vtable);
+            String owner = container.typeName == null ? container.family + " typeId=" + container.typeId :
+                container.typeName;
+            Address table = parseCaptureAddress(container.vtable);
+            if (container.scope != null) {
+                resolved++;
+                JsonObject action = containerAction("container_vtable", container.vtable, owner);
+                boolean applied = false;
+                if (applyRenames) {
+                    Symbol primary = symbols.getPrimarySymbol(table);
+                    if (primary == null || primary.getSource() == SourceType.DEFAULT) {
+                        applied = ensurePrimaryLabel(table, container.scope, "vftable", action);
+                    }
+                    else {
+                        applied = ensureLabel(table, container.scope, "vftable", action);
+                    }
+                }
+                finishContainerAction(action, applied, actions);
+            }
+            containerComment(table, CommentType.PLATE,
+                "Serialize container adapter for " + owner + " [" + container.typeId + "]. " +
+                "NewWorld 3-26 IDataContainer: 23 slots / 0xb8 bytes. Dump slots 23+ are adjacent tables. " +
+                "AZStd objects themselves have no vptr. Shared table/body aliases list every reflected owner.", actions);
+            JsonObject element = genericMember(arrayMember(container.genericInfo, "elements"), "element");
+            String stride = element == null ? null : stringMember(element, "dataSize");
+            for (int slot = 0; slot < CONTAINER_SLOT_NAMES.length; slot++) {
+                JsonObject entry = resolveObject(container.slots.get(slot), jsonObjectsById);
+                String address = stringMember(entry, "address");
+                String description = CONTAINER_SLOT_DESCRIPTIONS[slot];
+                containerComment(table.add(slot * 8L), CommentType.EOL,
+                    "IDataContainer slot " + slot + ": " + description, actions);
+                functionOwners.computeIfAbsent(address, key -> new ArrayList<>()).add(
+                    owner + " :: slot " + slot + " " + description +
+                    (stride == null ? "" : " ; serialized element bytes=" + stride));
+                functionContainers.computeIfAbsent(address, key -> new ArrayList<>()).add(container);
+                functionSlots.computeIfAbsent(address, key -> new LinkedHashSet<>()).add(slot);
+                if (container.scope != null && CONTAINER_SLOT_NAMES[slot] != null) {
+                    JsonObject action = containerAction("container_function_alias", address,
+                        fullName(container.scope, CONTAINER_SLOT_NAMES[slot]));
+                    boolean applied = applyRenames && ensureLabel(parseCaptureAddress(address),
+                        container.scope, CONTAINER_SLOT_NAMES[slot], action);
+                    finishContainerAction(action, applied, actions);
+                }
+            }
+        }
+        for (Map.Entry<String, ArrayList<String>> entry : functionOwners.entrySet()) {
+            monitor.checkCancelled();
+            String capturedAddress = entry.getKey();
+            Address address = parseCaptureAddress(capturedAddress);
+            ArrayList<SerializeContainer> owners = functionContainers.get(capturedAddress);
+            Set<Integer> slots = functionSlots.get(capturedAddress);
+            String localName = slots.size() == 1 ? CONTAINER_SLOT_NAMES[slots.iterator().next()] : null;
+            JsonObject action = containerAction("container_function", capturedAddress,
+                localName == null ? "unnamed callback" : localName);
+            Function function = currentProgram.getFunctionManager().getFunctionAt(address);
+            boolean changed = false;
+            boolean created = false;
+            if (applyRenames && function == null) {
+                function = createMissingFunction(address, localName, action);
+                created = function != null;
+                changed = created;
+            }
+            // Keep folded bodies and existing user names. Aliases carry their specialization identities.
+            if (applyRenames && function != null && owners.size() == 1 && localName != null &&
+                    owners.get(0).scope != null &&
+                    (created || function.getSymbol().getSource() == SourceType.DEFAULT)) {
+                changed |= applyFunctionRename(function, owners.get(0).scope, localName, action);
+            }
+            finishContainerAction(action, changed, actions);
+            containerComment(address, CommentType.PLATE,
+                "Serialize container callback owners, from serialize.json and validated live vtables:\n" +
+                String.join("\n", new LinkedHashSet<>(entry.getValue())), actions);
+        }
+        summary.addProperty("validatedSpecializations", validated);
+        summary.addProperty("namedSpecializations", resolved);
+        summary.addProperty("uniqueVtables", tables.size());
+        summary.addProperty("uniqueCallbacks", functionOwners.size());
+        summary.addProperty("unresolvedTypeNames", validated - resolved);
+        summary.addProperty("skipped", skipped.size());
+        return report;
+    }
+
+    private boolean supportsContainerPointerLayout() {
+        // Program/project names are editable. The pointer layout and live table checks identify the profile.
+        return currentProgram != null && currentProgram.getDefaultPointerSize() == 8 &&
+            !currentProgram.getLanguage().isBigEndian();
+    }
+
+    private String validateContainerTable(SerializeContainer container) {
+        Address table = parseCaptureAddress(container.vtable);
+        if (!isProgramAddress(table) || !isProgramAddress(table.add(0xb7))) {
+            return "vtable-not-in-program";
+        }
+        if (container.slots == null || container.slots.size() < CONTAINER_SLOT_NAMES.length) {
+            return "incomplete-container-slots";
+        }
+        for (int slot = 0; slot < CONTAINER_SLOT_NAMES.length; slot++) {
+            JsonObject entry = resolveObject(container.slots.get(slot), jsonObjectsById);
+            if (entry == null || !Integer.toString(slot).equals(stringMember(entry, "index"))) {
+                return "invalid-slot-index-" + slot;
+            }
+            Address expected = parseCaptureAddress(stringMember(entry, "address"));
+            if (!isExecutableAddress(expected) || !expected.equals(readPointer(table.add(slot * 8L)))) {
+                return "live-slot-mismatch-" + slot;
+            }
+        }
+        return null;
+    }
+
+    private JsonObject containerAction(String kind, String address, String target) {
+        JsonObject action = new JsonObject();
+        action.addProperty("kind", kind);
+        action.addProperty("address", address);
+        action.addProperty("target", target);
+        return action;
+    }
+
+    private void finishContainerAction(JsonObject action, boolean applied, ActionSink actions) {
+        action.addProperty("applied", applied);
+        if (!applyRenames) {
+            action.addProperty("wouldApply", true);
+        }
+        actions.add(action);
+    }
+
+    private void containerComment(Address address, CommentType type, String text, ActionSink actions) {
+        JsonObject action = containerAction("container_comment", address.toString(), text);
+        String existing = currentProgram.getListing().getComment(type, address);
+        boolean changed = existing == null || !existing.contains(text);
+        if (changed && applyRenames) {
+            CodeUnit unit = currentProgram.getListing().getCodeUnitAt(address);
+            if (pendingComments != null && unit != null) {
+                changed = ensureCommentLine(unit, type, text, action);
+            }
+            else {
+                currentProgram.getListing().setComment(address, type, existing == null ? text : existing + "\n" + text);
+            }
+        }
+        action.addProperty("applied", changed && applyRenames);
+        action.addProperty("wouldApply", changed && !applyRenames);
+        actions.add(action);
     }
 
     private boolean includeFullActionReport() {
         return optionBool(
             "full-actions",
             "AZOTH_SERIALIZE_RENAME_FULL_ACTIONS",
-            false);
+            true);
     }
 
     private File chooseInputFileViaPicker() throws Exception {
+        GhidraFileChooser chooser = createReflectionResourcesChooser();
+        try {
+            File selected = chooser.getSelectedFile();
+            if (selected == null) throw new CancelledException();
+            return selected;
+        }
+        finally { chooser.dispose(); }
+    }
+
+    private GhidraFileChooser createReflectionResourcesChooser() {
         GhidraFileChooser chooser = new GhidraFileChooser(null);
-        chooser.setTitle("Select SerializeContext JSON capture");
-        chooser.setApproveButtonText("Open");
-        chooser.setFileSelectionMode(GhidraFileChooserMode.FILES_AND_DIRECTORIES);
+        chooser.setTitle("Select reflection resources folder");
+        chooser.setApproveButtonText("Import reflection");
+        chooser.setFileSelectionMode(GhidraFileChooserMode.DIRECTORIES_ONLY);
         File lastDirectory = lastInputDirectory();
-        if (lastDirectory != null) {
-            chooser.setCurrentDirectory(lastDirectory);
-            File defaultInput = defaultSerializeInput(lastDirectory);
-            if (defaultInput != null) {
-                chooser.setSelectedFile(defaultInput);
-            }
-        }
-        File selected = chooser.getSelectedFile();
-        chooser.dispose();
-        if (selected == null) {
-            throw new CancelledException();
-        }
-        File input = selectedSerializeInput(selected);
-        if (input == null) {
-            throw new IllegalArgumentException(
-                "Selected directory does not contain serialize.json: "
-                    + selected.getAbsolutePath());
-        }
-        rememberInputDirectory(input);
-        return input;
-    }
-
-    private File selectedSerializeInput(File selected) {
-        if (selected == null) {
-            return null;
-        }
-        if (selected.isDirectory()) {
-            return defaultSerializeInput(selected);
-        }
-        return selected;
-    }
-
-    private File defaultSerializeInput(File directory) {
-        if (directory == null || !directory.isDirectory()) {
-            return null;
-        }
-        File serialize = new File(directory, "serialize.json");
-        if (serialize.isFile()) {
-            return serialize;
-        }
-        return null;
+        if (lastDirectory != null) chooser.setCurrentDirectory(lastDirectory);
+        return chooser;
     }
 
     private File lastInputDirectory() {
@@ -457,7 +1393,7 @@ public class AzReflectionRenamer extends GhidraScript {
                 .get(PREF_LAST_INPUT_DIR, null);
         }
         catch (SecurityException e) {
-            println("Unable to read last SerializeContext input directory: " +
+            println("Unable to read last reflection resources directory: " +
                 e.getMessage());
             return null;
         }
@@ -482,46 +1418,18 @@ public class AzReflectionRenamer extends GhidraScript {
                 .put(PREF_LAST_INPUT_DIR, directory.getAbsolutePath());
         }
         catch (SecurityException e) {
-            println("Unable to persist last SerializeContext input directory: " +
+            println("Unable to persist last reflection resources directory: " +
                 e.getMessage());
         }
     }
 
-    private boolean chooseApplyRenames() throws Exception {
-        if (dryRun) {
-            return false;
-        }
-        String explicit = optionValue("apply-renames", "AZOTH_SERIALIZE_RENAME");
-        if (explicit != null) {
-            return optionBool("apply-renames", "AZOTH_SERIALIZE_RENAME", false);
-        }
-        return askYesNo(
-            "AZ SerializeContext Renamer",
-            "Apply renames, datatypes, and signatures to the current Ghidra program?\n\n" +
-                "Yes: mutate symbols/namespaces/datatype manager/function signatures.\n" +
-                "No: dry-run only and write the report.");
+    private boolean chooseApplyRenames() {
+        return !dryRun && optionBool("apply-renames", "AZOTH_SERIALIZE_RENAME", true);
     }
 
-    private File chooseOutputFile(File input) throws Exception {
+    private File chooseOutputFile(File input) {
         String explicit = optionValue("out", "AZOTH_SERIALIZE_RENAME_OUT");
-        if (explicit != null) {
-            return new File(explicit);
-        }
-        String selected = askString(
-            "AZ SerializeContext Rename Report",
-            "Write rename report JSON to:",
-            defaultReportPath(input));
-        if (selected == null || selected.trim().isEmpty()) {
-            return new File(defaultReportPath(input));
-        }
-        return new File(selected.trim());
-    }
-
-    private String defaultReportPath(File input) {
-        String path = input.getAbsolutePath();
-        int dot = path.lastIndexOf('.');
-        String base = dot > 0 ? path.substring(0, dot) : path;
-        return base + ".renames.json";
+        return explicit == null ? new File(input.getParentFile(), "reflection-report.json") : new File(explicit);
     }
 
     private ModuleEvidenceIndex loadModuleEvidence(File serializeInput) {
@@ -536,7 +1444,7 @@ public class AzReflectionRenamer extends GhidraScript {
         index.inputCount = files.size();
         for (File file : files) {
             ModuleCapture module;
-            try (FileReader reader = new FileReader(file)) {
+            try (FileReader reader = new FileReader(file, StandardCharsets.UTF_8)) {
                 module = gson.fromJson(reader, ModuleCapture.class);
             }
             catch (Exception e) {
@@ -580,10 +1488,16 @@ public class AzReflectionRenamer extends GhidraScript {
         return index;
     }
 
+    private File requireExplicitInput(String path, String label) {
+        File file = new File(path);
+        if (!file.exists()) throw new IllegalArgumentException(label + " not found: " + file);
+        return file;
+    }
+
     private File moduleEvidenceInput(File serializeInput) {
         String explicit = optionValue("module-evidence", "AZOTH_SERIALIZE_MODULE_EVIDENCE");
         if (explicit != null) {
-            return new File(explicit);
+            return requireExplicitInput(explicit, "Module evidence");
         }
 
         File parent = serializeInput == null ? null : serializeInput.getParentFile();
@@ -739,6 +1653,11 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private Address resolvedThunkTarget(Address address) {
+        if (!isExecutableAddress(address)) {
+            increment(rejectedCodePointers, address == null ? "null" :
+                isProgramAddress(address) ? "non-executable" : "unmapped");
+            return null;
+        }
         ThisAdjustThunk thunk = thisAdjustThunk(address);
         if (thunk != null) {
             return thunk.targetAddress;
@@ -781,7 +1700,7 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         index.input = input.getAbsolutePath();
 
-        try (BufferedReader reader = new BufferedReader(new FileReader(input))) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(input, StandardCharsets.UTF_8))) {
             String line;
             int lineNumber = 0;
             while ((line = reader.readLine()) != null) {
@@ -797,11 +1716,13 @@ public class AzReflectionRenamer extends GhidraScript {
                 }
                 catch (Exception e) {
                     index.skippedRecords++;
+                    index.malformedRecords++;
                     index.skippedReasons.add(lineNumber + ":parse-failed");
                     continue;
                 }
                 if (value == null || !value.isJsonObject()) {
                     index.skippedRecords++;
+                    index.malformedRecords++;
                     index.skippedReasons.add(lineNumber + ":not-object");
                     continue;
                 }
@@ -829,7 +1750,7 @@ public class AzReflectionRenamer extends GhidraScript {
             "class-registration",
             "AZOTH_SERIALIZE_CLASS_REGISTRATION");
         if (explicit != null) {
-            return new File(explicit);
+            return requireExplicitInput(explicit, "Class registration trace");
         }
 
         File parent = serializeInput == null ? null : serializeInput.getParentFile();
@@ -946,7 +1867,7 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         index.input = input.getAbsolutePath();
 
-        try (BufferedReader reader = new BufferedReader(new FileReader(input))) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(input, StandardCharsets.UTF_8))) {
             String line;
             int lineNumber = 0;
             while ((line = reader.readLine()) != null) {
@@ -962,11 +1883,13 @@ public class AzReflectionRenamer extends GhidraScript {
                 }
                 catch (Exception e) {
                     index.skippedRecords++;
+                    index.malformedRecords++;
                     index.skippedReasons.add(lineNumber + ":parse-failed");
                     continue;
                 }
                 if (value == null || !value.isJsonObject()) {
                     index.skippedRecords++;
+                    index.malformedRecords++;
                     index.skippedReasons.add(lineNumber + ":not-object");
                     continue;
                 }
@@ -1306,7 +2229,7 @@ public class AzReflectionRenamer extends GhidraScript {
             "field-registration",
             "AZOTH_SERIALIZE_FIELD_REGISTRATION");
         if (explicit != null) {
-            return new File(explicit);
+            return requireExplicitInput(explicit, "Field registration trace");
         }
 
         File parent = serializeInput == null ? null : serializeInput.getParentFile();
@@ -1437,7 +2360,8 @@ public class AzReflectionRenamer extends GhidraScript {
         return report;
     }
 
-    private BehaviorContextEvidence loadBehaviorContextEvidence(File serializeInput) {
+    private BehaviorContextEvidence loadBehaviorContextEvidence(File serializeInput) throws Exception {
+        if (inputFile == null) inputFile = serializeInput;
         BehaviorContextEvidence index = new BehaviorContextEvidence();
         BehaviorContextInput input = findBehaviorContextInput(serializeInput);
         if (input == null) {
@@ -1452,12 +2376,14 @@ public class AzReflectionRenamer extends GhidraScript {
         boolean readProperties = false;
         boolean readEbuses = false;
         boolean readTypeToClassMap = false;
+        boolean readOnDemand = false;
         try (
             Reader source = input.openReader();
             JsonReader reader = new JsonReader(new BufferedReader(source))
         ) {
             reader.beginObject();
             while (reader.hasNext()) {
+                monitor.checkCancelled();
                 String name = reader.nextName();
                 if ((name.equals("classes") || name.equals("m_classes")) && !readClasses) {
                     readClasses = true;
@@ -1479,13 +2405,29 @@ public class AzReflectionRenamer extends GhidraScript {
                 else if ((name.equals("typeToClassMap") || name.equals("m_typeToClassMap")) &&
                     !readTypeToClassMap) {
                     readTypeToClassMap = true;
-                    index.typeToClassMapCount = countArrayValues(reader);
+                    scanBehaviorTypeToClassMap(reader, index);
+                }
+                else if ((name.equals("onDemandReflection") || name.equals("m_onDemandReflection")) &&
+                    !readOnDemand) {
+                    readOnDemand = true;
+                    scanBehaviorOnDemand(reader, index);
+                }
+                else if (!Set.of("classes", "m_classes", "methods", "m_methods", "properties",
+                    "m_properties", "ebuses", "m_ebuses", "typeToClassMap", "m_typeToClassMap",
+                    "onDemandReflection", "m_onDemandReflection").contains(name)) {
+                    index.contextMetadata.add(name, compactBehaviorMetadata(JsonParser.parseReader(reader)));
                 }
                 else {
                     reader.skipValue();
                 }
             }
             reader.endObject();
+        }
+        catch (CancelledException error) {
+            throw error;
+        }
+        catch (ReportStorageException error) {
+            throw error;
         }
         catch (Exception error) {
             index.skippedInputs++;
@@ -1500,6 +2442,7 @@ public class AzReflectionRenamer extends GhidraScript {
         String explicit = optionValue("behavior-context", "AZOTH_BEHAVIOR_CONTEXT_JSON");
         if (explicit != null) {
             File file = new File(explicit);
+            if (!file.isFile()) throw new IllegalArgumentException("BehaviorContext file not found: " + file);
             return behaviorContextFileInput(file);
         }
         if (serializeInput == null) {
@@ -1510,9 +2453,11 @@ public class AzReflectionRenamer extends GhidraScript {
             return null;
         }
         File sibling = new File(parent, "behavior-context.json");
-        if (sibling.exists()) {
+        if (sibling.isFile()) {
             return behaviorContextFileInput(sibling);
         }
+        File zipSibling = new File(parent, "behavior-context.json.zip");
+        if (zipSibling.isFile()) return behaviorContextFileInput(zipSibling);
         File compressedSibling = new File(parent, "behavior-context.7z");
         return behaviorContextFileInput(compressedSibling);
     }
@@ -1521,10 +2466,26 @@ public class AzReflectionRenamer extends GhidraScript {
         if (file == null || !file.exists() || !file.isFile()) {
             return null;
         }
+        if (file.getName().toLowerCase(Locale.ROOT).endsWith(".zip")) {
+            try (ZipFile archive = new ZipFile(file)) {
+                List<? extends ZipEntry> entries = Collections.list(archive.entries());
+                for (ZipEntry entry : entries) {
+                    String name = entry.getName().replace('\\', '/');
+                    if (!entry.isDirectory() && (name.equalsIgnoreCase("behavior-context.json") ||
+                            name.toLowerCase(Locale.ROOT).endsWith("/behavior-context.json"))) {
+                        return new BehaviorContextInput(file, entry.getName());
+                    }
+                }
+                throw new IllegalArgumentException("behavior-context.json missing from " + file);
+            }
+            catch (IOException error) {
+                throw new IllegalArgumentException("Cannot read BehaviorContext archive: " + file, error);
+            }
+        }
         if (file.getName().toLowerCase(Locale.ROOT).endsWith(".7z")) {
             String entryName = behaviorContextArchiveEntry(file);
             if (entryName == null) {
-                return null;
+                throw new IllegalArgumentException("behavior-context.json missing from " + file);
             }
             return new BehaviorContextInput(file, entryName);
         }
@@ -1532,8 +2493,6 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private String behaviorContextArchiveEntry(File archiveFile) {
-        String firstJson = null;
-        String firstFile = null;
         try (SevenZFile archive = new SevenZFile(archiveFile)) {
             SevenZArchiveEntry entry;
             while ((entry = archive.getNextEntry()) != null) {
@@ -1549,18 +2508,12 @@ public class AzReflectionRenamer extends GhidraScript {
                     normalized.endsWith("/behavior-context.json")) {
                     return entryName;
                 }
-                if (firstJson == null && normalized.endsWith(".json")) {
-                    firstJson = entryName;
-                }
-                if (firstFile == null) {
-                    firstFile = entryName;
-                }
             }
         }
-        catch (Exception ignored) {
-            return null;
+        catch (IOException error) {
+            throw new IllegalArgumentException("Cannot read BehaviorContext archive: " + archiveFile, error);
         }
-        return firstJson != null ? firstJson : firstFile;
+        return null;
     }
 
     private int countArrayValues(JsonReader reader) throws Exception {
@@ -1579,8 +2532,153 @@ public class AzReflectionRenamer extends GhidraScript {
 
         reader.beginArray();
         while (reader.hasNext()) {
+            monitor.checkCancelled();
             JsonObject record = JsonParser.parseReader(reader).getAsJsonObject();
+            JsonObject second = objectMemberDirect(record, "second");
+            if (second != null) record = second;
             scanBehaviorClass(record, index);
+        }
+        reader.endArray();
+    }
+
+    private JsonElement behaviorMember(JsonObject object, String field) {
+        if (object == null) return null;
+        JsonElement value = object.get(field);
+        if (value == null || value.isJsonNull()) {
+            value = object.get(field.startsWith("m_") ? field.substring(2) : "m_" + field);
+        }
+        return value;
+    }
+
+    private JsonObject behaviorObject(JsonObject object, String field) {
+        return resolveBehaviorObject(behaviorMember(object, field));
+    }
+
+    private JsonArray behaviorArray(JsonObject object, String field) {
+        JsonElement value = behaviorMember(object, field);
+        return value != null && value.isJsonArray() ? value.getAsJsonArray() : null;
+    }
+
+    // Keep native members and all unique decoded evidence without storing alias copies.
+    private JsonElement compactBehaviorMetadata(JsonElement value) {
+        if (value == null || value.isJsonNull()) return com.google.gson.JsonNull.INSTANCE;
+        if (value.isJsonArray()) {
+            JsonArray result = new JsonArray();
+            for (JsonElement item : value.getAsJsonArray()) result.add(compactBehaviorMetadata(item));
+            return result;
+        }
+        if (!value.isJsonObject()) return value.deepCopy();
+        JsonObject object = value.getAsJsonObject();
+        JsonObject result = new JsonObject();
+        for (Map.Entry<String, JsonElement> entry : object.entrySet()) {
+            String key = entry.getKey();
+            if (isBehaviorAlias(object, key, entry.getValue())) continue;
+            result.add(key, compactBehaviorMetadata(entry.getValue()));
+        }
+        return result;
+    }
+
+    private boolean isBehaviorAlias(JsonObject object, String key, JsonElement value) {
+        if (!key.startsWith("m_") && value.equals(object.get("m_" + key))) return true;
+        String nativeKey = switch (key) {
+            case "implementationFunction" -> "m_functionPtr";
+            case "implementationSecondWord" -> "m_functionPtrSecondWord";
+            case "implementationWords" -> "m_functionPtrWords";
+            default -> null;
+        };
+        if (nativeKey != null && value.equals(object.get(nativeKey))) return true;
+        if (key.equals("second") && (value.equals(object.get("method")) ||
+            value.equals(object.get("property")))) return true;
+        if (key.equals("functions") && value.isJsonObject()) {
+            for (Map.Entry<String, JsonElement> callback : value.getAsJsonObject().entrySet()) {
+                if (!callback.getValue().equals(object.get("m_" + callback.getKey()))) return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private JsonObject behaviorOwnerFacts(JsonObject owner, BehaviorContextEvidence index) {
+        JsonObject facts = new JsonObject();
+        for (String field : List.of("name", "typeId", "baseClasses", "requestBuses",
+            "notificationBuses", "wrappedTypeId", "unwrapperUserData", "idParam",
+            "deprecatedName", "toolTip", "attributes", "valueHasher")) {
+            JsonElement value = behaviorMember(owner, field);
+            if (value != null) facts.add(field, compactBehaviorMetadata(value));
+        }
+        countBehaviorAttributes(behaviorArray(owner, "m_attributes"), index);
+        return facts;
+    }
+
+    private void countBehaviorAttributes(JsonArray attributes, BehaviorContextEvidence index) {
+        if (attributes == null) return;
+        for (JsonElement item : attributes) {
+            if (!item.isJsonObject()) continue;
+            JsonObject attribute = item.getAsJsonObject();
+            String name = stringMemberDirect(attribute, "attributeName");
+            if (name == null) name = stringMemberDirect(attribute, "name");
+            if (name == null) name = stringMemberDirect(attribute, "attributeId");
+            if (name == null) name = stringMemberDirect(attribute, "crc");
+            increment(index.attributeCounts, name == null ? "unnamed" : name);
+            JsonObject value = objectMemberDirect(attribute, "value");
+            if (value != null && !value.has("value") && !value.has("flags")) {
+                increment(index.unresolvedCounts, "attribute-value-not-captured");
+            }
+        }
+    }
+
+    private void scanBehaviorTypeToClassMap(JsonReader reader, BehaviorContextEvidence index)
+        throws Exception {
+        reader.beginArray();
+        while (reader.hasNext()) {
+            monitor.checkCancelled();
+            JsonObject record = JsonParser.parseReader(reader).getAsJsonObject();
+            index.typeToClassMapCount++;
+            JsonObject link = new JsonObject();
+            for (String key : List.of("typeId", "first", "className", "classAddress")) {
+                if (record.has(key)) link.add(key, compactBehaviorMetadata(record.get(key)));
+            }
+            index.typeToClassInventory.add(link);
+            JsonObject klass = objectMemberDirect(record, "second");
+            if (klass == null) klass = objectMemberDirect(record, "class");
+            if (klass == null) {
+                increment(index.unresolvedCounts, "type-map-class-not-captured");
+                continue;
+            }
+            String keyId = normalizeTypeId(stringMemberDirect(record, "typeId"));
+            if (keyId == null) keyId = normalizeTypeId(stringMemberDirect(record, "first"));
+            String classId = normalizeTypeId(behaviorTypeId(klass));
+            if (keyId != null && classId != null && !keyId.equals(classId)) {
+                index.layoutConflicts.add("BehaviorContext type map UUID mismatch: " + keyId + " vs " + classId);
+                continue;
+            }
+            if (classId == null && keyId != null) klass.addProperty("m_typeId", keyId);
+            scanBehaviorClass(klass, index);
+        }
+        reader.endArray();
+    }
+
+    private void scanBehaviorOnDemand(JsonReader reader, BehaviorContextEvidence index)
+        throws Exception {
+        reader.beginArray();
+        while (reader.hasNext()) {
+            monitor.checkCancelled();
+            JsonObject record = JsonParser.parseReader(reader).getAsJsonObject();
+            index.onDemandInventory.add(compactBehaviorMetadata(record));
+            String typeId = normalizeTypeId(stringMemberDirect(record, "key"));
+            if (typeId == null) typeId = normalizeTypeId(stringMemberDirect(record, "first"));
+            String address = stringMemberDirect(record, "value");
+            if (address == null) address = stringMemberDirect(record, "second");
+            if (typeId == null || !isAddressLike(address)) {
+                increment(index.unresolvedCounts, "on-demand-reflector-not-captured");
+                continue;
+            }
+            JsonObject method = new JsonObject();
+            method.addProperty("m_functionPtr", address);
+            method.addProperty("reflectedTypeId", typeId);
+            addBehaviorMethodCandidate(index,
+                behaviorScope("AZ", "BehaviorContext", "OnDemandReflection<" + typeId + ">"),
+                "behavior.onDemandReflection", "Reflect", method);
         }
         reader.endArray();
     }
@@ -1596,6 +2694,7 @@ public class AzReflectionRenamer extends GhidraScript {
                 continue;
             }
             index.globalMethodCount++;
+            index.globalMethodInventory.add(method);
             addBehaviorMethodCandidate(
                 index,
                 behaviorScope("AZ", "BehaviorContext"),
@@ -1618,19 +2717,28 @@ public class AzReflectionRenamer extends GhidraScript {
                 continue;
             }
             index.globalPropertyCount++;
+            index.globalPropertyInventory.add(property);
+            BehaviorConstantProperty constant = new BehaviorConstantProperty();
+            constant.name = behaviorName(property, null);
+            constant.getter = behaviorFunctionAddress(behaviorObject(property, "m_getter"));
+            constant.writable = behaviorObject(property, "m_setter") != null;
+            index.globalProperties.add(constant);
+            countBehaviorAttributes(behaviorArray(property, "m_attributes"), index);
             String propertyName = safeTypeName(behaviorName(property, "Property"));
+            int firstCandidate = index.functionCandidates.size();
             addBehaviorMethodCandidate(
                 index,
                 behaviorScope("AZ", "BehaviorContext"),
                 "global.property.getter",
                 behaviorAccessorName("Get", propertyName),
-                objectMemberDirect(property, "m_getter"));
+                behaviorObject(property, "m_getter"));
             addBehaviorMethodCandidate(
                 index,
                 behaviorScope("AZ", "BehaviorContext"),
                 "global.property.setter",
                 behaviorAccessorName("Set", propertyName),
-                objectMemberDirect(property, "m_setter"));
+                behaviorObject(property, "m_setter"));
+            attachBehaviorPropertyEvidence(index, firstCandidate, property);
         }
         reader.endArray();
     }
@@ -1647,15 +2755,31 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private void scanBehaviorClass(JsonObject klass, BehaviorContextEvidence index) {
-        index.classCount++;
         String className = behaviorName(klass, null);
+        String identity = normalizeTypeId(behaviorTypeId(klass));
+        if (identity == null) identity = stringMemberDirect(klass, "address");
+        if (identity != null && !index.seenClasses.add(identity)) return;
+        index.classCount++;
+        index.classInventory.add(klass);
         String typeId = behaviorTypeId(klass);
         if (typeId != null) {
             String normalizedTypeId = normalizeTypeId(typeId);
             if (normalizedTypeId != null) {
                 index.classTypeIds.add(normalizedTypeId);
+                if (knownSourceName(className) != null) {
+                    index.typeNamesByTypeId.put(normalizedTypeId, className);
+                }
+                BehaviorClassMetadata metadata = new BehaviorClassMetadata();
+                metadata.typeId = normalizedTypeId;
+                metadata.name = className;
+                metadata.size = parseLayoutInteger(stringMemberDirect(klass, "m_size"));
+                if (metadata.size == null) metadata.size = parseLayoutInteger(stringMemberDirect(klass, "size"));
+                metadata.alignment = parseLayoutInteger(stringMemberDirect(klass, "m_alignment"));
+                if (metadata.alignment == null) metadata.alignment = parseLayoutInteger(stringMemberDirect(klass, "alignment"));
+                index.classesByTypeId.put(normalizedTypeId, metadata);
             }
         }
+        int firstCandidate = index.functionCandidates.size();
         addBehaviorRttiType(index, klass, className, typeId);
         ArrayList<String> scope = behaviorQualifiedScope(className, "BehaviorClass");
         if (!scope.isEmpty()) {
@@ -1704,7 +2828,7 @@ public class AzReflectionRenamer extends GhidraScript {
             klass,
             "m_valueHasher");
 
-        JsonArray constructors = arrayMember(klass, "m_constructors");
+        JsonArray constructors = behaviorArray(klass, "m_constructors");
         if (constructors != null) {
             for (JsonElement value : constructors) {
                 JsonObject method = behaviorMethod(value);
@@ -1716,7 +2840,7 @@ public class AzReflectionRenamer extends GhidraScript {
             }
         }
 
-        JsonArray methods = arrayMember(klass, "m_methods");
+        JsonArray methods = behaviorArray(klass, "m_methods");
         if (methods != null) {
             for (JsonElement value : methods) {
                 JsonObject method = behaviorMethod(value);
@@ -1733,7 +2857,7 @@ public class AzReflectionRenamer extends GhidraScript {
             }
         }
 
-        JsonArray properties = arrayMember(klass, "m_properties");
+        JsonArray properties = behaviorArray(klass, "m_properties");
         if (properties != null) {
             for (JsonElement value : properties) {
                 JsonObject property = behaviorProperty(value);
@@ -1741,33 +2865,44 @@ public class AzReflectionRenamer extends GhidraScript {
                     continue;
                 }
                 index.classPropertyCount++;
+                countBehaviorAttributes(behaviorArray(property, "m_attributes"), index);
                 String propertyName = safeTypeName(behaviorName(property, "Property"));
+                int firstPropertyCandidate = index.functionCandidates.size();
                 addBehaviorMethodCandidate(
                     index,
                     scope,
                     "class.property.getter",
                     behaviorAccessorName("Get", propertyName),
-                    objectMemberDirect(property, "m_getter"));
+                    behaviorObject(property, "m_getter"));
                 addBehaviorMethodCandidate(
                     index,
                     scope,
                     "class.property.setter",
                     behaviorAccessorName("Set", propertyName),
-                    objectMemberDirect(property, "m_setter"));
+                    behaviorObject(property, "m_setter"));
+                attachBehaviorPropertyEvidence(index, firstPropertyCandidate, property);
             }
         }
 
-        JsonArray baseClasses = arrayMember(klass, "m_baseClasses");
+        JsonArray baseClasses = behaviorArray(klass, "m_baseClasses");
         if (baseClasses != null) {
             index.classBaseEdgeCount += baseClasses.size();
         }
-        JsonArray requestBuses = arrayMember(klass, "m_requestBuses");
+        JsonArray requestBuses = behaviorArray(klass, "m_requestBuses");
         if (requestBuses != null) {
             index.classRequestBusEdgeCount += requestBuses.size();
         }
-        JsonArray notificationBuses = arrayMember(klass, "m_notificationBuses");
+        JsonArray notificationBuses = behaviorArray(klass, "m_notificationBuses");
         if (notificationBuses != null) {
             index.classNotificationBusEdgeCount += notificationBuses.size();
+        }
+        for (int i = firstCandidate; i < index.functionCandidates.size(); i++) {
+            index.functionCandidates.get(i).ownerTypeId = normalizeTypeId(typeId);
+        }
+        JsonObject facts = behaviorOwnerFacts(klass, index);
+        if (normalizeTypeId(typeId) != null) index.classFactsByTypeId.put(normalizeTypeId(typeId), facts);
+        for (int i = firstCandidate; i < index.functionCandidates.size(); i++) {
+            index.functionCandidates.get(i).ownerMetadata = facts;
         }
     }
 
@@ -1799,6 +2934,8 @@ public class AzReflectionRenamer extends GhidraScript {
 
     private void scanBehaviorEbus(JsonObject bus, BehaviorContextEvidence index) {
         index.ebusCount++;
+        index.ebusInventory.add(bus);
+        int firstCandidate = index.functionCandidates.size();
         String busName = behaviorName(bus, null);
         if (busName != null) {
             increment(index.busNameCounts, busName);
@@ -1840,7 +2977,7 @@ public class AzReflectionRenamer extends GhidraScript {
             bus,
             "m_ebusHandlerOnDemandReflector");
 
-        JsonArray events = arrayMember(bus, "m_events");
+        JsonArray events = behaviorArray(bus, "m_events");
         Map<String, String> eventNamesByAddress = new HashMap<>();
         if (events != null) {
             for (JsonElement value : events) {
@@ -1849,7 +2986,9 @@ public class AzReflectionRenamer extends GhidraScript {
                     continue;
                 }
                 index.ebusEventCount++;
+                countBehaviorAttributes(behaviorArray(event, "m_attributes"), index);
                 String eventName = safeTypeName(behaviorName(event, "Event"));
+                int firstEventCandidate = index.functionCandidates.size();
                 rememberBehaviorEventName(eventNamesByAddress, event, eventName);
                 addBehaviorScopedEventCandidate(
                     index,
@@ -1857,32 +2996,33 @@ public class AzReflectionRenamer extends GhidraScript {
                     "ebus.event.broadcast",
                     "Broadcast",
                     behaviorEventFunctionName(eventName),
-                    objectMemberDirect(event, "m_broadcast"));
+                    behaviorObject(event, "m_broadcast"));
                 addBehaviorScopedEventCandidate(
                     index,
                     scope,
                     "ebus.event.event",
                     "Event",
                     behaviorEventFunctionName(eventName),
-                    objectMemberDirect(event, "m_event"));
+                    behaviorObject(event, "m_event"));
                 addBehaviorScopedEventCandidate(
                     index,
                     scope,
                     "ebus.event.queueBroadcast",
                     "QueueBroadcast",
                     behaviorEventFunctionName(eventName),
-                    objectMemberDirect(event, "m_queueBroadcast"));
+                    behaviorObject(event, "m_queueBroadcast"));
                 addBehaviorScopedEventCandidate(
                     index,
                     scope,
                     "ebus.event.queueEvent",
                     "QueueEvent",
                     behaviorEventFunctionName(eventName),
-                    objectMemberDirect(event, "m_queueEvent"));
+                    behaviorObject(event, "m_queueEvent"));
+                attachBehaviorPropertyEvidence(index, firstEventCandidate, event);
             }
         }
 
-        JsonArray virtualProperties = arrayMember(bus, "m_virtualProperties");
+        JsonArray virtualProperties = behaviorArray(bus, "m_virtualProperties");
         if (virtualProperties != null) {
             for (JsonElement value : virtualProperties) {
                 JsonObject property = behaviorEvent(value);
@@ -1890,6 +3030,7 @@ public class AzReflectionRenamer extends GhidraScript {
                     continue;
                 }
                 index.ebusVirtualPropertyCount++;
+                countBehaviorAttributes(behaviorArray(property, "m_attributes"), index);
                 String propertyName = safeTypeName(behaviorName(property, "Property"));
                 scanBehaviorVirtualProperty(
                     index,
@@ -1897,7 +3038,7 @@ public class AzReflectionRenamer extends GhidraScript {
                     busName,
                     propertyName,
                     eventNamesByAddress,
-                    objectMemberDirect(property, "m_getter"),
+                    behaviorObject(property, "m_getter"),
                     "getter");
                 scanBehaviorVirtualProperty(
                     index,
@@ -1905,9 +3046,38 @@ public class AzReflectionRenamer extends GhidraScript {
                     busName,
                     propertyName,
                     eventNamesByAddress,
-                    objectMemberDirect(property, "m_setter"),
+                    behaviorObject(property, "m_setter"),
                     "setter");
             }
+        }
+        JsonObject facts = behaviorOwnerFacts(bus, index);
+        JsonObject idParameter = behaviorObject(bus, "m_idParam");
+        if (idParameter != null && behaviorTypeId(idParameter) == null) {
+            increment(index.unresolvedCounts, "ebus-id-type-uuid-not-captured");
+            facts.addProperty("idTypeResolution", "unresolved-capture-reference");
+        }
+        JsonArray propertyLinks = new JsonArray();
+        if (virtualProperties != null) {
+            for (JsonElement value : virtualProperties) {
+                JsonObject property = behaviorEvent(value);
+                if (property == null) continue;
+                JsonObject link = new JsonObject();
+                link.addProperty("name", behaviorName(property, null));
+                JsonArray attributes = behaviorArray(property, "m_attributes");
+                if (attributes != null) link.add("attributes", compactBehaviorMetadata(attributes));
+                for (String side : List.of("getter", "setter")) {
+                    JsonObject event = behaviorObject(property, "m_" + side);
+                    if (event != null) {
+                        link.addProperty(side + "Event", behaviorEventNameFor(event, eventNamesByAddress));
+                        link.addProperty(side + "Address", stringMemberDirect(event, "address"));
+                    }
+                }
+                propertyLinks.add(link);
+            }
+        }
+        facts.add("virtualProperties", propertyLinks);
+        for (int i = firstCandidate; i < index.functionCandidates.size(); i++) {
+            index.functionCandidates.get(i).ownerMetadata = facts;
         }
     }
 
@@ -1943,28 +3113,41 @@ public class AzReflectionRenamer extends GhidraScript {
             "ebus.virtualProperty." + side + ".broadcast",
             "Broadcast",
             localName,
-            objectMemberDirect(property, "m_broadcast"));
+            behaviorObject(property, "m_broadcast"));
         addBehaviorScopedEventCandidate(
             index,
             scope,
             "ebus.virtualProperty." + side + ".event",
             "Event",
             localName,
-            objectMemberDirect(property, "m_event"));
+            behaviorObject(property, "m_event"));
         addBehaviorScopedEventCandidate(
             index,
             scope,
             "ebus.virtualProperty." + side + ".queueBroadcast",
             "QueueBroadcast",
             localName,
-            objectMemberDirect(property, "m_queueBroadcast"));
+            behaviorObject(property, "m_queueBroadcast"));
         addBehaviorScopedEventCandidate(
             index,
             scope,
             "ebus.virtualProperty." + side + ".queueEvent",
             "QueueEvent",
             localName,
-            objectMemberDirect(property, "m_queueEvent"));
+            behaviorObject(property, "m_queueEvent"));
+    }
+
+    private void attachBehaviorPropertyEvidence(
+        BehaviorContextEvidence index, int firstCandidate, JsonObject property) {
+        JsonObject facts = new JsonObject();
+        facts.addProperty("name", behaviorName(property, null));
+        for (String key : List.of("attributes", "deprecatedName", "toolTip", "typeId")) {
+            JsonElement value = behaviorMember(property, key);
+            if (value != null) facts.add(key, compactBehaviorMetadata(value));
+        }
+        for (int i = firstCandidate; i < index.functionCandidates.size(); i++) {
+            index.functionCandidates.get(i).metadata.add("propertyOrEvent", facts);
+        }
     }
 
     private void rememberBehaviorEventName(
@@ -1979,19 +3162,19 @@ public class AzReflectionRenamer extends GhidraScript {
             eventName);
         rememberBehaviorEventAddress(
             eventNamesByAddress,
-            behaviorMethodAddress(objectMemberDirect(event, "m_broadcast")),
+            behaviorMethodAddress(behaviorObject(event, "m_broadcast")),
             eventName);
         rememberBehaviorEventAddress(
             eventNamesByAddress,
-            behaviorMethodAddress(objectMemberDirect(event, "m_event")),
+            behaviorMethodAddress(behaviorObject(event, "m_event")),
             eventName);
         rememberBehaviorEventAddress(
             eventNamesByAddress,
-            behaviorMethodAddress(objectMemberDirect(event, "m_queueBroadcast")),
+            behaviorMethodAddress(behaviorObject(event, "m_queueBroadcast")),
             eventName);
         rememberBehaviorEventAddress(
             eventNamesByAddress,
-            behaviorMethodAddress(objectMemberDirect(event, "m_queueEvent")),
+            behaviorMethodAddress(behaviorObject(event, "m_queueEvent")),
             eventName);
     }
 
@@ -2023,25 +3206,25 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         name = behaviorEventNameByAddress(
             eventNamesByAddress,
-            behaviorMethodAddress(objectMemberDirect(event, "m_broadcast")));
+            behaviorMethodAddress(behaviorObject(event, "m_broadcast")));
         if (name != null) {
             return name;
         }
         name = behaviorEventNameByAddress(
             eventNamesByAddress,
-            behaviorMethodAddress(objectMemberDirect(event, "m_event")));
+            behaviorMethodAddress(behaviorObject(event, "m_event")));
         if (name != null) {
             return name;
         }
         name = behaviorEventNameByAddress(
             eventNamesByAddress,
-            behaviorMethodAddress(objectMemberDirect(event, "m_queueBroadcast")));
+            behaviorMethodAddress(behaviorObject(event, "m_queueBroadcast")));
         if (name != null) {
             return name;
         }
         return behaviorEventNameByAddress(
             eventNamesByAddress,
-            behaviorMethodAddress(objectMemberDirect(event, "m_queueEvent")));
+            behaviorMethodAddress(behaviorObject(event, "m_queueEvent")));
     }
 
     private String behaviorEventNameByAddress(
@@ -2066,7 +3249,21 @@ public class AzReflectionRenamer extends GhidraScript {
         JsonObject owner,
         String field) {
 
-        JsonObject method = objectMemberDirect(owner, field);
+        JsonObject method = behaviorObject(owner, field);
+        JsonObject functions = objectMemberDirect(owner, "functions");
+        String normalizedField = field.startsWith("m_") ? field.substring(2) : field;
+        if (field.equals("m_ebusHandlerOnDemandReflector")) normalizedField = "handlerReflector";
+        if (method == null) method = objectMemberDirect(owner, normalizedField);
+        if (method == null && functions != null) method = resolveBehaviorObject(functions.get(normalizedField));
+        if (method == null) {
+            String address = stringMemberDirect(owner, field);
+            if (address == null) address = stringMemberDirect(owner, normalizedField);
+            if (address == null && functions != null) address = stringMemberDirect(functions, normalizedField);
+            if (isAddressLike(address)) {
+                method = new JsonObject();
+                method.addProperty("m_functionPtr", address);
+            }
+        }
         addBehaviorMethodCandidate(index, scope, kind, localName, method);
     }
 
@@ -2115,6 +3312,7 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         String address = behaviorFunctionAddress(method);
         if (!isAddressLike(address)) {
+            increment(index.unresolvedCounts, "method-without-native-function");
             return;
         }
         String safeLocalName = safeTypeName(localName);
@@ -2128,6 +3326,11 @@ public class AzReflectionRenamer extends GhidraScript {
         candidate.kind = kind;
         candidate.slot = behaviorVirtualSlot(method);
         candidate.methodName = behaviorName(method, null);
+        candidate.metadata = compactBehaviorMetadata(method).getAsJsonObject();
+        countBehaviorAttributes(behaviorArray(method, "m_attributes"), index);
+        if (!method.has("m_arguments") && !method.has("arguments") && !method.has("parameters")) {
+            increment(index.unresolvedCounts, "method-signature-not-captured");
+        }
         index.functionCandidates.add(candidate);
         increment(index.kindCounts, kind);
 
@@ -2193,20 +3396,298 @@ public class AzReflectionRenamer extends GhidraScript {
         }
 
         for (BehaviorFunctionGroup group : index.groupsByAddress.values()) {
+            monitor.checkCancelled();
             if (!group.slots.isEmpty()) {
                 processBehaviorVirtualDispatchGroup(group, functionSeen, aliasSeen, actions);
             }
             else if (group.candidates.size() == 1 || group.targetNames.size() == 1) {
                 BehaviorFunctionCandidate candidate = group.candidates.get(0);
                 renameBehaviorFunction(group, candidate, functionSeen, actions);
+                addBehaviorFunctionAliases(group, "behavior_function_alias", null, aliasSeen, actions);
             }
             else {
                 addBehaviorSharedFunction(group, actions);
+                addBehaviorFunctionAliases(group, "behavior_shared_function_alias", null, aliasSeen, actions);
             }
+            applyBehaviorFunctionMetadata(group, aliasSeen, actions);
             if (monitor.isCancelled()) {
                 return;
             }
         }
+        applyBehaviorClassFacts(index, actions);
+        processBehaviorConstants(index, actions);
+    }
+
+    private void applyBehaviorClassFacts(BehaviorContextEvidence index, ActionSink actions) {
+        for (Map.Entry<String, JsonObject> entry : index.classFactsByTypeId.entrySet()) {
+            enrichBehaviorTypeReferences(entry.getValue());
+            String name = datatypeNames.get(entry.getKey());
+            if (name == null) continue;
+            List<String> parts = cppScopeParts(name);
+            if (parts.isEmpty()) continue;
+            String typeName = parts.get(parts.size() - 1);
+            CategoryPath category = new CategoryPath("/" + String.join("/", parts.subList(0, parts.size() - 1)));
+            DataType type = dataTypeManager.getDataType(category, typeName);
+            if (type == null || !isGeneratedReflectedDatatype(type)) continue;
+            String facts = "\nBehaviorContext facts: " + entry.getValue();
+            String existing = type.getDescription();
+            int oldFacts = existing.indexOf("\nBehaviorContext facts: ");
+            String updated = (oldFacts < 0 ? existing : existing.substring(0, oldFacts)) + facts;
+            if (existing.equals(updated)) continue;
+            JsonObject action = new JsonObject();
+            action.addProperty("kind", "behavior_class_metadata");
+            action.addProperty("typeId", entry.getKey());
+            action.addProperty("datatypePath", type.getPathName());
+            action.addProperty("applied", applyRenames);
+            if (applyRenames) type.setDescription(updated);
+            else {
+                action.addProperty("wouldApply", true);
+                action.addProperty("reason", "dry-run");
+            }
+            actions.add(action);
+        }
+    }
+
+    private void applyBehaviorFunctionMetadata(
+        BehaviorFunctionGroup group, Set<String> seen, ActionSink actions) throws Exception {
+        for (BehaviorFunctionCandidate candidate : group.candidates) {
+            monitor.checkCancelled();
+            enrichBehaviorTypeReferences(candidate.ownerMetadata);
+            enrichBehaviorTypeReferences(candidate.metadata);
+            String name = fullName(candidate.scope, candidate.localName);
+            JsonObject evidence = new JsonObject();
+            evidence.addProperty("name", name);
+            evidence.addProperty("kind", candidate.kind);
+            if (candidate.ownerTypeId != null) evidence.addProperty("ownerTypeId", candidate.ownerTypeId);
+            if (candidate.ownerMetadata != null) evidence.add("owner", candidate.ownerMetadata);
+            if (candidate.metadata != null) evidence.add("method", candidate.metadata);
+            String comment = "BehaviorContext evidence: " + evidence;
+            String digest = behaviorCommentDigest(comment);
+            if (seen.add("metadata|" + addressKey(candidate.address) + "|" + digest)) {
+                addBehaviorComment(candidate.address, comment, "behavior-metadata", actions);
+            }
+            if (candidate.metadata == null) continue;
+            ArrayList<String> wrapperScope = behaviorScope("AZ", "BehaviorContext", "Method<" + name + ">");
+            String implementationOffset = captureOffset(candidate.address);
+            if (implementationOffset != null) {
+                addBehaviorEvidenceLabel(candidate.address, wrapperScope,
+                    "Implementation<0x" + implementationOffset + ">", "behavior_method_implementation",
+                    comment, seen, actions);
+            }
+            String vtable = stringMemberDirect(candidate.metadata, "vtable");
+            addBehaviorEvidenceLabel(vtable, wrapperScope, "vftable", "behavior_method_adapter_vtable",
+                comment, seen, actions);
+            JsonArray reflectFunctions = behaviorArray(candidate.metadata, "m_reflectFunction");
+            if (reflectFunctions != null) {
+                for (JsonElement value : reflectFunctions) {
+                    if (!value.isJsonPrimitive()) continue;
+                    String address = value.getAsString();
+                    String offset = captureOffset(address);
+                    if (offset == null) continue;
+                    addBehaviorEvidenceLabel(address, wrapperScope,
+                        "Reflect<0x" + offset + ">",
+                        "behavior_method_reflector", comment, seen, actions);
+                }
+            }
+        }
+    }
+
+    private void enrichBehaviorTypeReferences(JsonObject object) {
+        if (object == null || object.has("resolvedTypes")) return;
+        JsonObject resolved = new JsonObject();
+        collectBehaviorTypeReferences(object, resolved);
+        if (resolved.size() > 0) object.add("resolvedTypes", resolved);
+    }
+
+    private void collectBehaviorTypeReferences(JsonElement value, JsonObject resolved) {
+        if (value == null || value.isJsonNull()) return;
+        if (value.isJsonArray()) {
+            for (JsonElement item : value.getAsJsonArray()) collectBehaviorTypeReferences(item, resolved);
+        }
+        else if (value.isJsonObject()) {
+            for (Map.Entry<String, JsonElement> entry : value.getAsJsonObject().entrySet()) {
+                if (!entry.getKey().equals("resolvedTypes")) collectBehaviorTypeReferences(entry.getValue(), resolved);
+            }
+        }
+        else if (value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()) {
+            String typeId = normalizeTypeId(value.getAsString());
+            if ("00000000-0000-0000-0000-000000000000".equals(typeId)) return;
+            String name = typeId == null ? null : datatypeNames.get(typeId);
+            if (name != null) resolved.addProperty(typeId, name);
+        }
+    }
+
+    private void addBehaviorEvidenceLabel(
+        String jsonAddress, ArrayList<String> scope, String localName, String kind,
+        String comment, Set<String> seen, ActionSink actions) throws Exception {
+        if (!isAddressLike(jsonAddress)) return;
+        String name = fullName(scope, localName);
+        if (!seen.add(kind + "|" + addressKey(jsonAddress) + "|" + name)) return;
+        Address address = parseCaptureAddress(jsonAddress);
+        JsonObject action = new JsonObject();
+        action.addProperty("kind", kind);
+        action.addProperty("address", jsonAddress);
+        action.addProperty("name", name);
+        action.addProperty("applied", false);
+        if (!isProgramAddress(address) ||
+            ((kind.equals("behavior_method_reflector") || kind.equals("behavior_method_implementation")) &&
+                !isExecutableAddress(address))) {
+            action.addProperty("reason", "address-not-in-program");
+        }
+        else {
+            recordTargetNameAddress(name, jsonAddress, action);
+            if (applyRenames) action.addProperty("applied", ensureLabel(address, scope, localName, action));
+            else {
+                action.addProperty("wouldApply", true);
+                action.addProperty("reason", "dry-run");
+            }
+        }
+        actions.add(action);
+        if (seen.add("evidence-comment|" + addressKey(jsonAddress) + "|" + behaviorCommentDigest(comment))) {
+            addBehaviorComment(jsonAddress, comment, "behavior-metadata", actions);
+        }
+    }
+
+    private String behaviorCommentDigest(String text) throws Exception {
+        byte[] digest = MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8));
+        return java.util.HexFormat.of().formatHex(digest);
+    }
+
+    private void processBehaviorConstants(BehaviorContextEvidence index, ActionSink actions) throws Exception {
+        while (index.constantInventory.size() > 0) index.constantInventory.remove(index.constantInventory.size() - 1);
+        index.unresolvedCounts.remove("constant-value-not-recovered");
+        Map<String, EnumDataType> families = new LinkedHashMap<>();
+        for (BehaviorConstantProperty property : index.globalProperties) {
+            monitor.checkCancelled();
+            if (property.writable) continue;
+            String address = property.getter;
+            JsonObject entry = new JsonObject();
+            String name = property.name;
+            entry.addProperty("name", name);
+            entry.addProperty("getter", address);
+            long[] value = readBehaviorIntegerConstant(address);
+            if (name == null || value == null) {
+                entry.addProperty("reason", "getter-is-not-a-proven-integer-constant");
+                increment(index.unresolvedCounts, "constant-value-not-recovered");
+                index.constantInventory.add(entry);
+                continue;
+            }
+            // Property prefixes identify script constant families, not native C++ enum identities.
+            int separator = name.lastIndexOf('_');
+            String family = safeTypeName(separator > 0 ? name.substring(0, separator) : "GlobalConstants");
+            if (family == null) family = "GlobalConstants";
+            int width = (int) value[1];
+            String familyKey = family + "_" + (width * 8) + "bit";
+            EnumDataType type = families.get(familyKey);
+            if (type == null) {
+                type = new EnumDataType(new CategoryPath("/AZ/BehaviorContext/Constants"), familyKey, width);
+                type.setDescription("AZ BehaviorContext recovered constant family; values are verified return-register bits. " +
+                    "Property prefix grouping does not establish native enum UUID or storage size.");
+                families.put(familyKey, type);
+            }
+            String member = safeTypeName(name);
+            if (member == null) {
+                entry.addProperty("reason", "invalid-constant-name");
+                index.constantInventory.add(entry);
+                continue;
+            }
+            boolean conflict = false;
+            boolean present = false;
+            for (String existing : type.getNames()) {
+                if (existing.equals(member)) {
+                    present = true;
+                    conflict = type.getValue(member) != value[0];
+                    break;
+                }
+            }
+            if (conflict) {
+                entry.addProperty("reason", "constant-name-value-conflict");
+                index.constantInventory.add(entry);
+                continue;
+            }
+            if (!present) type.add(member, value[0], "BehaviorContext property " + name + "; getter " + address);
+            entry.addProperty("returnBits", "0x" + Long.toUnsignedString(value[0], 16));
+            entry.addProperty("returnRegisterBytes", width);
+            entry.addProperty("datatypePath", type.getPathName());
+            entry.addProperty("identity", "script-property-family; native-enum-identity-unavailable");
+            index.constantInventory.add(entry);
+            addBehaviorComment(address, "BehaviorContext constant " + name + " = " +
+                entry.get("returnBits").getAsString() + "; " + type.getPathName() +
+                "; native enum UUID/storage size not captured", "behavior-constant", actions);
+        }
+        for (EnumDataType type : families.values()) {
+            monitor.checkCancelled();
+            JsonObject action = new JsonObject();
+            action.addProperty("kind", "behavior_constant_enum");
+            action.addProperty("datatypePath", type.getPathName());
+            action.addProperty("values", type.getCount());
+            DataType existing = dataTypeManager.getDataType(type.getCategoryPath(), type.getName());
+            boolean applied = false;
+            if (existing != null && (!(existing instanceof ghidra.program.model.data.Enum) ||
+                existing.getDescription() == null ||
+                !existing.getDescription().startsWith("AZ BehaviorContext recovered constant family"))) {
+                action.addProperty("reason", "manual-datatype-preserved");
+            }
+            else if (existing != null && sameBehaviorEnum((ghidra.program.model.data.Enum) existing, type)) {
+                action.addProperty("reason", "already-current");
+            }
+            else if (applyRenames) {
+                if (existing instanceof ghidra.program.model.data.Enum) {
+                    ((ghidra.program.model.data.Enum) existing).replaceWith(type);
+                }
+                else dataTypeManager.addDataType(type, DataTypeConflictHandler.DEFAULT_HANDLER);
+                applied = true;
+            }
+            else {
+                action.addProperty("wouldApply", true);
+                action.addProperty("reason", "dry-run");
+            }
+            action.addProperty("applied", applied);
+            actions.add(action);
+        }
+    }
+
+    private boolean sameBehaviorEnum(ghidra.program.model.data.Enum left, EnumDataType right) {
+        if (left.getLength() != right.getLength() || left.getCount() != right.getCount()) return false;
+        for (String name : right.getNames()) {
+            boolean found = false;
+            for (String other : left.getNames()) if (name.equals(other)) found = true;
+            if (!found || left.getValue(name) != right.getValue(name) ||
+                !sameText(left.getComment(name), right.getComment(name))) return false;
+        }
+        return true;
+    }
+
+    private long[] readBehaviorIntegerConstant(String jsonAddress) {
+        if (jsonAddress == null || currentProgram.getDefaultPointerSize() != 8 ||
+            currentProgram.getLanguage().isBigEndian() ||
+            !currentProgram.getLanguage().getProcessor().toString().equalsIgnoreCase("x86")) return null;
+        try {
+            Address address = parseCaptureAddress(jsonAddress);
+            if (!isProgramAddress(address) || !isExecutableAddress(address)) return null;
+            int opcode = Byte.toUnsignedInt(currentProgram.getMemory().getByte(address));
+            if (opcode == 0xb8 && currentProgram.getMemory().getByte(address.add(5)) == (byte) 0xc3) {
+                return new long[]{Integer.toUnsignedLong(currentProgram.getMemory().getInt(address.add(1))), 4};
+            }
+            if ((opcode == 0x31 || opcode == 0x33) &&
+                currentProgram.getMemory().getByte(address.add(1)) == (byte) 0xc0 &&
+                currentProgram.getMemory().getByte(address.add(2)) == (byte) 0xc3) {
+                return new long[]{0, 4};
+            }
+            if (opcode == 0x48 && currentProgram.getMemory().getByte(address.add(1)) == (byte) 0xb8 &&
+                currentProgram.getMemory().getByte(address.add(10)) == (byte) 0xc3) {
+                return new long[]{currentProgram.getMemory().getLong(address.add(2)), 8};
+            }
+            if (opcode == 0x48 && currentProgram.getMemory().getByte(address.add(1)) == (byte) 0xc7 &&
+                currentProgram.getMemory().getByte(address.add(2)) == (byte) 0xc0 &&
+                currentProgram.getMemory().getByte(address.add(7)) == (byte) 0xc3) {
+                return new long[]{currentProgram.getMemory().getInt(address.add(3)), 8};
+            }
+        }
+        catch (Exception ignored) {
+            // Dynamic getters and unavailable bytes remain explicit unresolved evidence.
+        }
+        return null;
     }
 
     private void processBehaviorVirtualDispatchGroup(
@@ -2217,6 +3698,7 @@ public class AzReflectionRenamer extends GhidraScript {
 
         if (group.slots.size() != 1) {
             addBehaviorSharedFunction(group, actions);
+            addBehaviorFunctionAliases(group, "behavior_shared_function_alias", null, aliasSeen, actions);
             return;
         }
         String slot = group.slots.first();
@@ -2242,7 +3724,12 @@ public class AzReflectionRenamer extends GhidraScript {
         String slot,
         Set<String> aliasSeen,
         ActionSink actions) throws Exception {
+        addBehaviorFunctionAliases(group, "behavior_virtual_dispatch_alias", slot, aliasSeen, actions);
+    }
 
+    private void addBehaviorFunctionAliases(
+        BehaviorFunctionGroup group, String kind, String slot,
+        Set<String> aliasSeen, ActionSink actions) throws Exception {
         for (BehaviorFunctionCandidate candidate : group.candidates) {
             if (candidate.scope == null || candidate.localName == null) {
                 continue;
@@ -2256,11 +3743,11 @@ public class AzReflectionRenamer extends GhidraScript {
 
             Address address = parseCaptureAddress(candidate.address);
             JsonObject action = new JsonObject();
-            action.addProperty("kind", "behavior_virtual_dispatch_alias");
+            action.addProperty("kind", kind);
             action.addProperty("address", candidate.address);
             action.addProperty("name", targetName);
             action.addProperty("behaviorKind", candidate.kind);
-            action.addProperty("virtualDispatchSlotOffset", slot);
+            if (slot != null) action.addProperty("virtualDispatchSlotOffset", slot);
             if (candidate.methodName != null) {
                 action.addProperty("methodName", candidate.methodName);
             }
@@ -2270,9 +3757,7 @@ public class AzReflectionRenamer extends GhidraScript {
                 actions.add(action);
                 continue;
             }
-            if (!reserveTargetName(targetName, candidate.address, action, actions)) {
-                continue;
-            }
+            recordTargetNameAddress(targetName, candidate.address, action);
 
             boolean applied = false;
             if (applyRenames) {
@@ -2355,14 +3840,14 @@ public class AzReflectionRenamer extends GhidraScript {
         }
     }
 
-    private ArrayList<Address> behaviorNameStringAddresses(BehaviorFunctionCandidate candidate) {
+    private ArrayList<Address> behaviorNameStringAddresses(BehaviorFunctionCandidate candidate) throws CancelledException {
         ArrayList<Address> result = new ArrayList<>();
         addStringAddresses(result, candidate.localName);
         addStringAddresses(result, candidate.methodName);
         return result;
     }
 
-    private void addStringAddresses(ArrayList<Address> result, String text) {
+    private void addStringAddresses(ArrayList<Address> result, String text) throws CancelledException {
         if (text == null || text.isEmpty()) {
             return;
         }
@@ -2382,6 +3867,7 @@ public class AzReflectionRenamer extends GhidraScript {
         Address center,
         Address target) {
 
+        if (owner == null || !isProgramAddress(center) || target == null) return false;
         Instruction instruction =
             currentProgram.getListing().getInstructionContaining(center);
         if (instruction == null) {
@@ -2432,6 +3918,7 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private Address nextCallInFunction(Function owner, Address center, int maxInstructions) {
+        if (owner == null || !isProgramAddress(center)) return null;
         Instruction cursor =
             currentProgram.getListing().getInstructionContaining(center);
         if (cursor == null) {
@@ -2448,6 +3935,7 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private Address callTargetFromCallsite(Address callsite) {
+        if (!isProgramAddress(callsite)) return null;
         Instruction instruction = currentProgram.getListing().getInstructionAt(callsite);
         if (instruction == null || !instruction.getFlowType().isCall()) {
             return null;
@@ -2517,9 +4005,7 @@ public class AzReflectionRenamer extends GhidraScript {
         action.addProperty("oldName", function.getName(true));
 
         boolean applied = false;
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
 
         String comment = "BehaviorContext builder use: " + eventTargetName +
             " via EBusBuilder::Event";
@@ -2657,9 +4143,7 @@ public class AzReflectionRenamer extends GhidraScript {
             actions.add(action);
             return;
         }
-        if (!reserveTargetName(targetName, candidate.address, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, candidate.address, action);
 
         Function function = currentProgram.getFunctionManager().getFunctionAt(address);
         boolean created = false;
@@ -2678,11 +4162,11 @@ public class AzReflectionRenamer extends GhidraScript {
         action.addProperty("oldName", function.getName(true));
         action.addProperty("created", created);
         boolean applied = false;
-        if (applyRenames && !function.getName(true).equals(targetName)) {
+        if (applyRenames && !functionHasTargetName(function, candidate.scope, candidate.localName)) {
             applied = applyFunctionRename(function, candidate.scope, candidate.localName, action);
         }
         action.addProperty("applied", applied);
-        if (!applyRenames && !function.getName(true).equals(targetName)) {
+        if (!applyRenames && !functionHasTargetName(function, candidate.scope, candidate.localName)) {
             action.addProperty("wouldApply", true);
             action.addProperty("reason", "dry-run");
         }
@@ -2745,6 +4229,20 @@ public class AzReflectionRenamer extends GhidraScript {
         String comment,
         JsonObject action) {
 
+        if (pendingComments != null) {
+            String key = codeUnit.getAddress() + "|" + commentType;
+            PendingComment pending = pendingComments.get(key);
+            if (pending == null) {
+                pending = new PendingComment(codeUnit.getAddress(), commentType, codeUnit.getComment(commentType));
+                pendingComments.put(key, pending);
+            }
+            if (!pending.lines.add(comment)) {
+                action.addProperty("reason", "already-current");
+                return false;
+            }
+            pending.additions.add(comment);
+            return true;
+        }
         String existing = codeUnit.getComment(commentType);
         if (existing != null) {
             for (String line : existing.split("\\R")) {
@@ -2761,6 +4259,40 @@ public class AzReflectionRenamer extends GhidraScript {
         return true;
     }
 
+    private void flushPendingComments() throws CancelledException {
+        for (PendingComment pending : pendingComments.values()) {
+            monitor.checkCancelled();
+            if (pending.additions.isEmpty()) continue;
+            CodeUnit unit = currentProgram.getListing().getCodeUnitAt(pending.address);
+            if (unit == null) continue;
+            String existing = unit.getComment(pending.type);
+            LinkedHashSet<String> lines = new LinkedHashSet<>();
+            if (existing != null) Collections.addAll(lines, existing.split("\\R"));
+            StringBuilder text = new StringBuilder(existing == null ? "" : existing);
+            for (String addition : pending.additions) {
+                if (!lines.add(addition)) continue;
+                if (text.length() > 0) text.append('\n');
+                text.append(addition);
+            }
+            String merged = text.toString();
+            if (!sameText(existing, merged)) unit.setComment(pending.type, merged);
+        }
+        pendingComments.clear();
+    }
+
+    private static class PendingComment {
+        final Address address;
+        final CommentType type;
+        final Set<String> lines = new HashSet<>();
+        final ArrayList<String> additions = new ArrayList<>();
+
+        PendingComment(Address address, CommentType type, String existing) {
+            this.address = address;
+            this.type = type;
+            if (existing != null) Collections.addAll(lines, existing.split("\\R"));
+        }
+    }
+
     private JsonObject behaviorMethod(JsonElement value) {
         JsonObject object = resolveBehaviorObject(value);
         if (object == null) {
@@ -2768,11 +4300,11 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         JsonObject method = objectMemberDirect(object, "method");
         if (method != null) {
-            return method;
+            return behaviorNamedRecord(method, object);
         }
         JsonObject second = objectMemberDirect(object, "second");
-        if (second != null && behaviorFunctionAddress(second) != null) {
-            return second;
+        if (second != null) {
+            return behaviorNamedRecord(second, object);
         }
         return object;
     }
@@ -2784,13 +4316,11 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         JsonObject property = objectMemberDirect(object, "property");
         if (property != null) {
-            return property;
+            return behaviorNamedRecord(property, object);
         }
         JsonObject second = objectMemberDirect(object, "second");
-        if (second != null && (
-            objectMemberDirect(second, "m_getter") != null ||
-                objectMemberDirect(second, "m_setter") != null)) {
-            return second;
+        if (second != null) {
+            return behaviorNamedRecord(second, object);
         }
         return object;
     }
@@ -2800,8 +4330,22 @@ public class AzReflectionRenamer extends GhidraScript {
         if (object == null) {
             return null;
         }
+        // "event" is also the normalized per-ID dispatch method, not always a map wrapper.
+        if (behaviorObject(object, "m_broadcast") != null ||
+            behaviorObject(object, "m_queueBroadcast") != null ||
+            behaviorObject(object, "m_queueEvent") != null ||
+            object.has("m_event")) return object;
         JsonObject event = objectMemberDirect(object, "event");
-        return event == null ? object : event;
+        if (event != null && behaviorFunctionAddress(event) != null) return object;
+        if (event == null) event = objectMemberDirect(object, "second");
+        return event == null ? object : behaviorNamedRecord(event, object);
+    }
+
+    private JsonObject behaviorNamedRecord(JsonObject record, JsonObject wrapper) {
+        if (behaviorName(record, null) == null && behaviorName(wrapper, null) != null) {
+            record.addProperty("name", behaviorName(wrapper, null));
+        }
+        return record;
     }
 
     private JsonObject resolveBehaviorObject(JsonElement value) {
@@ -2884,15 +4428,11 @@ public class AzReflectionRenamer extends GhidraScript {
             scope.add("BehaviorContext");
             return scope;
         }
-        for (String part : value.split("::")) {
-            String safe = safeTypeName(part);
-            if (safe != null) {
-                scope.add(safe);
-            }
-        }
+        scope.addAll(cppScopeParts(value));
         if (scope.isEmpty()) {
             scope.add("BehaviorContext");
         }
+        registerReflectedClassScope(scope);
         return scope;
     }
 
@@ -2909,12 +4449,8 @@ public class AzReflectionRenamer extends GhidraScript {
 
     private String behaviorLocalName(JsonObject method, String fallback) {
         String name = behaviorName(method, fallback);
-        if (name != null) {
-            int index = name.lastIndexOf("::");
-            if (index >= 0 && index + 2 < name.length()) {
-                name = name.substring(index + 2);
-            }
-        }
+        List<String> parts = cppScopeParts(name);
+        if (!parts.isEmpty()) name = parts.get(parts.size() - 1);
         String safe = safeTypeName(name);
         return safe == null ? fallback : safe;
     }
@@ -3029,6 +4565,10 @@ public class AzReflectionRenamer extends GhidraScript {
         report.addProperty("directEventFunctions", index.directEventFunctionCount);
         report.addProperty("virtualEventFunctions", index.virtualEventFunctionCount);
         report.addProperty("behaviorClassTypeIds", index.classTypeIds.size());
+        report.addProperty("onDemandReflectors", index.onDemandInventory.size());
+        report.add("unresolvedMetadata", mapToJson(index.unresolvedCounts));
+        report.add("attributes", mapToJson(index.attributeCounts));
+        report.add("layoutConflicts", stringArray(index.layoutConflicts));
         report.add("kindCounts", mapToJson(index.kindCounts));
         JsonArray duplicateBusNames = new JsonArray();
         for (String name : index.duplicateBusNames) {
@@ -3084,14 +4624,13 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private String buildSummary(ScanResult scan, ActionSink actions, ActionStats stats) {
-        int duplicateCount = countReason(stats, "duplicate-target-name");
         int addressOutsideProgramCount = countReason(stats, "address-not-in-program");
         int functionMissingCount = countReason(stats, "function-missing");
         int functionCreateFailedCount = countReason(stats, "function-create-failed");
         int dryRunCount = countReason(stats, "dry-run");
 
         StringBuilder summary = new StringBuilder();
-        summary.append("AZ SerializeContext rename ");
+        summary.append("AZ reflection import ");
         summary.append(applyRenames ? "applied" : "dry run");
         summary.append("\n\nInput:\n  ");
         summary.append(inputFile.getAbsolutePath());
@@ -3103,8 +4642,9 @@ public class AzReflectionRenamer extends GhidraScript {
         summary.append("\n  Class records: ").append(scan.classData.size());
         summary.append("\n  Element callbacks: ").append(elementCallbackCount(scan.classData));
         summary.append("\n  Ambiguous source type names: ").append(scan.collidingTypeNames.size());
-        summary.append("\n  Unresolved type-name collisions: ")
+        summary.append("\n  Unresolved source-name identities: ")
             .append(scan.unresolvedCollidingTypeNames.size());
+        summary.append("\n  Datatype paths separated by UUID: ").append(datatypeConflictingPaths.size());
         appendCollisionExamples(summary, scan.collidingTypeIdsByName);
 
         summary.append("\n\nModule evidence:");
@@ -3195,7 +4735,6 @@ public class AzReflectionRenamer extends GhidraScript {
         summary.append("\n  Dry-run ready: ").append(dryRunCount);
         summary.append("\n  Function missing in dry run: ").append(functionMissingCount);
         summary.append("\n  Function create failed in apply: ").append(functionCreateFailedCount);
-        summary.append("\n  Duplicate target names skipped: ").append(duplicateCount);
         summary.append("\n  Outside loaded program skipped: ").append(addressOutsideProgramCount);
 
         summary.append("\n\nBy kind:");
@@ -3221,13 +4760,12 @@ public class AzReflectionRenamer extends GhidraScript {
         appendActionExamples(summary, actions, "dry-run", "Ready rename examples");
         appendActionExamples(summary, actions, "function-missing", "Functions that apply mode can create");
         appendActionExamples(summary, actions, "function-create-failed", "Functions apply mode could not create");
-        appendActionExamples(summary, actions, "duplicate-target-name", "Duplicate target names skipped");
         appendActionExamples(summary, actions, "address-not-in-program", "Outside-program addresses skipped");
         appendActionExamples(
             summary,
             actions,
             "shared-behavior-function",
-            "Shared BehaviorContext helpers skipped");
+            "Shared BehaviorContext implementations with owner aliases");
         appendActionExamples(
             summary,
             actions,
@@ -3238,15 +4776,18 @@ public class AzReflectionRenamer extends GhidraScript {
         if (!applyRenames) {
             summary.append("\n  This did not mutate the program.");
             summary.append("\n  Apply is OK for non-conflicting actions.");
-            summary.append("\n  duplicate-target-name entries will be skipped, not renamed.");
+            summary.append("\n  Identical qualified symbol names are allowed at different addresses.");
             summary.append("\n  ambiguous source type names are reported with their UUID sets.");
+            summary.append("\n  Datatypes sharing a source name use separate __typeid__/UUID categories.");
             summary.append("\n  function-missing entries are expected in dry run; apply mode tries to create them first.");
         }
         else {
             summary.append("\n  Non-conflicting actions were applied.");
-            summary.append("\n  duplicate-target-name and address-not-in-program entries were skipped.");
+            summary.append("\n  Identical qualified symbol names were retained at different addresses.");
+            summary.append("\n  address-not-in-program entries were skipped.");
             summary.append("\n  function-create-failed entries include clear/disassemble diagnostics.");
             summary.append("\n  ambiguous source type names were not given synthetic suffixes.");
+            summary.append("\n  Datatypes sharing a source name use separate __typeid__/UUID categories.");
         }
         return summary.toString();
     }
@@ -3419,6 +4960,21 @@ public class AzReflectionRenamer extends GhidraScript {
         copyActionProperty(action, sample, "fieldCount");
         copyActionProperty(action, sample, "fieldsWritten");
         copyActionProperty(action, sample, "fieldFailures");
+        copyActionProperty(action, sample, "detail");
+        copyActionProperty(action, sample, "error");
+        copyActionProperty(action, sample, "errorType");
+        copyActionProperty(action, sample, "signatureChecked");
+        copyActionProperty(action, sample, "callingConvention");
+        copyActionProperty(action, sample, "automaticParameters");
+        copyActionProperty(action, sample, "plannedFormalParameters");
+        copyActionProperty(action, sample, "plannedParameterStorage");
+        copyActionProperty(action, sample, "parameterNameAdjustments");
+        copyActionProperty(action, sample, "customStoragePreserved");
+        copyActionProperty(action, sample, "materializedAutomaticThis");
+        copyActionProperty(action, sample, "thisTypeManagedByClassNamespace");
+        copyActionProperty(action, sample, "requestedThisType");
+        copyActionProperty(action, sample, "storageRepair");
+        copyActionProperty(action, sample, "storageDetail");
         copyActionProperty(action, sample, "function");
         copyActionProperty(action, sample, "behaviorUseCount");
         copyActionProperty(action, sample, "virtualDispatchSlotOffset");
@@ -3523,19 +5079,22 @@ public class AzReflectionRenamer extends GhidraScript {
 
     private void printHelp() {
         println("AzReflectionRenamer " + SCRIPT_VERSION);
-        println("Inspect captured reflection evidence and optionally apply names and datatypes.");
+        println("Import SerializeContext, BehaviorContext and modules; TypeRegistry is excluded.");
         println("");
         println("Options:");
-        println("  --serialize-json <FILE>       SerializeContext capture [env: AZOTH_SERIALIZE_JSON]");
+        println("  --resources <DIR>             Discover reflection captures [env: AZOTH_REFLECTION_RESOURCES]");
+        println("  --serialize-json <FILE>       Alternate SerializeContext file; discover siblings [env: AZOTH_SERIALIZE_JSON]");
         println("  --module-evidence <PATH>      Module evidence file or directory [env: AZOTH_SERIALIZE_MODULE_EVIDENCE]");
         println("  --class-registration <FILE>   Class-registration trace [env: AZOTH_SERIALIZE_CLASS_REGISTRATION]");
         println("  --field-registration <FILE>   Field-registration trace [env: AZOTH_SERIALIZE_FIELD_REGISTRATION]");
         println("  --behavior-context <FILE>     BehaviorContext JSON or archive [env: AZOTH_BEHAVIOR_CONTEXT_JSON]");
-        println("  --out <FILE>                  Rename report [env: AZOTH_SERIALIZE_RENAME_OUT]");
-        println("  --apply-renames[=<BOOL>]      Apply program mutations [env: AZOTH_SERIALIZE_RENAME]");
+        println("  --out <FILE>                  Default: resources/reflection-report.json [env: AZOTH_SERIALIZE_RENAME_OUT]");
+        println("  --apply-renames[=<BOOL>]      Default: true [env: AZOTH_SERIALIZE_RENAME]");
         println("  --full-actions[=<BOOL>]       Include every action [env: AZOTH_SERIALIZE_RENAME_FULL_ACTIONS]");
-        println("  --force                       Replace an existing report");
-        println("  --dry-run                     Analyze without mutations or filesystem writes");
+        println("  Capture files are optional individually; BehaviorContext JSON/ZIP/7z and modules are discovered.");
+        println("  --force[=<BOOL>]              Replace report, default: true");
+        println("  --dry-run                     Validate without program edits; save *-dry-run.json beside --out");
+        println("  Validation runs automatically before applying. Any validation errors block program edits.");
         println("  -h, --help                    Print help");
         println("  -V, --version                 Print version");
     }
@@ -3551,6 +5110,17 @@ public class AzReflectionRenamer extends GhidraScript {
             indexGenericInfo(root, objects, objectsById);
         LinkedHashMap<String, String> rawTypeNamesByTypeId =
             indexRawTypeNames(objects);
+        datatypeGenerics = genericInfoByTypeId;
+        datatypeNames = rawTypeNamesByTypeId;
+        enumUnderlyingTypes.clear();
+        JsonObject enumMap = objectMember(root.getAsJsonObject(), "enumTypeIdToUnderlyingTypeIdMap");
+        if (enumMap != null) {
+            for (Map.Entry<String, JsonElement> entry : enumMap.entrySet()) {
+                enumUnderlyingTypes.put(normalizeTypeId(entry.getKey()), normalizeTypeId(stringElement(entry.getValue())));
+            }
+        }
+        nativeLayoutProfile = matchesNativeLayoutProfile();
+        indexReflectedClassScopes(genericInfoByTypeId, rawTypeNamesByTypeId);
 
         for (JsonObject object : objects) {
             ClassData classRecord =
@@ -3567,6 +5137,7 @@ public class AzReflectionRenamer extends GhidraScript {
                 genericInfoByTypeId,
                 rawTypeNamesByTypeId);
         }
+        appendAdditionalReflectionTypes(classData, rawTypeNamesByTypeId);
 
         LinkedHashSet<String> collidingTypeNames = new LinkedHashSet<>();
         LinkedHashMap<String, LinkedHashSet<String>> collidingTypeIdsByName = new LinkedHashMap<>();
@@ -3599,6 +5170,131 @@ public class AzReflectionRenamer extends GhidraScript {
         result.unresolvedCollidingTypeNames = unresolvedCollisions.names;
         result.unresolvedCollidingTypeIdsByName = unresolvedCollisions.typeIdsByName;
         result.typeEvidence = typeEvidence;
+        return result;
+    }
+
+    private void appendAdditionalReflectionTypes(List<ClassData> classData, Map<String, String> names) {
+        Set<String> existing = new HashSet<>();
+        for (ClassData data : classData) existing.add(normalizeTypeId(data.typeId));
+        if (behaviorContextEvidence != null) {
+            for (BehaviorClassMetadata metadata : behaviorContextEvidence.classesByTypeId.values()) {
+                appendReflectionType(classData, existing, metadata.typeId,
+                    knownTypeName(metadata.typeId, metadata.name, names), "behavior-context");
+            }
+        }
+        if (moduleEvidence != null) {
+            for (Descriptor descriptor : moduleEvidence.descriptors) {
+                String id = descriptorTypeId(descriptor);
+                appendReflectionType(classData, existing, id,
+                    knownTypeName(id, null, names), "module-descriptor");
+            }
+        }
+    }
+
+    private void appendReflectionType(List<ClassData> classData, Set<String> existing,
+            String id, String name, String source) {
+        if (id == null || knownSourceName(name) == null || !existing.add(id)) return;
+        ClassData data = new ClassData();
+        data.typeId = id;
+        data.typeName = name;
+        data.reflectionSource = source;
+        data.objects = new LinkedHashMap<>();
+        data.callbacks = new LinkedHashMap<>();
+        data.elements = new ArrayList<>();
+        classData.add(data);
+    }
+
+    private void reconcileBehaviorTypeScopes(List<ClassData> classData) {
+        Map<String, ClassData> canonical = new LinkedHashMap<>();
+        for (ClassData data : canonicalClassDataByTypeId(classData)) canonical.put(normalizeTypeId(data.typeId), data);
+        for (BehaviorFunctionCandidate candidate : behaviorContextEvidence.functionCandidates) {
+            ClassData owner = canonical.get(candidate.ownerTypeId);
+            DatatypeTarget target = owner == null ? null : datatypeTarget(owner);
+            if (target != null) candidate.scope = new ArrayList<>(target.scope);
+            if (candidate.kind.equals("behavior.onDemandReflection")) {
+                String typeId = stringMemberDirect(candidate.metadata, "reflectedTypeId");
+                String typeName = datatypeNames.get(typeId);
+                if (typeName != null) candidate.scope =
+                    behaviorScope("AZ", "BehaviorContext", "OnDemandReflection<" + typeName + ">");
+            }
+        }
+        for (BehaviorFunctionGroup group : behaviorContextEvidence.groupsByAddress.values()) {
+            group.targetNames.clear();
+            for (BehaviorFunctionCandidate candidate : group.candidates) {
+                group.targetNames.add(fullName(candidate.scope, candidate.localName));
+            }
+        }
+        behaviorContextEvidence.safeDirectFunctionCount = 0;
+        behaviorContextEvidence.sharedFunctionGroupCount = 0;
+        behaviorContextEvidence.virtualDispatchGroupCount = 0;
+        behaviorContextEvidence.duplicateFunctionAddressGroupCount = 0;
+        finalizeBehaviorContextEvidence(behaviorContextEvidence);
+        for (RttiType type : behaviorContextEvidence.rttiTypes.values()) {
+            ClassData owner = canonical.get(normalizeTypeId(type.typeId));
+            if (owner != null) {
+                type.typeName = owner.typeName;
+                type.targetTypeName = owner.targetTypeName;
+                type.ownerScope = owner.ownerScope;
+            }
+        }
+    }
+
+    private JsonArray reflectedTypesReport(List<ClassData> classData) {
+        JsonArray result = new JsonArray();
+        for (ClassData data : canonicalClassDataByTypeId(classData)) {
+            JsonObject record = new JsonObject();
+            record.addProperty("typeId", data.typeId);
+            DatatypeTarget target = datatypeTarget(data);
+            record.addProperty("name", target == null ? data.typeName : String.join("::", target.scope));
+            if (target != null) record.addProperty("datatypePath", datatypePathName(target));
+            record.addProperty("size", reflectedLayoutSize(data));
+            record.addProperty("sizeEvidence", typeEvidence.nativeDataSizesByTypeId.containsKey(normalizeTypeId(data.typeId)) ?
+                "captured-native-size" : nativeProfileSize(data) > 0 ? "verified-native-profile" : reflectedLayoutSize(data) > 0 ? "serialized-field-extent" : "unknown");
+            JsonArray sources = new JsonArray();
+            sources.add(data.reflectionSource == null ? "serialize-context" : data.reflectionSource);
+            if (behaviorContextEvidence.classesByTypeId.containsKey(normalizeTypeId(data.typeId)) &&
+                    !"behavior-context".equals(data.reflectionSource)) sources.add("behavior-context");
+            if (moduleEvidence.ownersByTypeId.containsKey(normalizeTypeId(data.typeId)) &&
+                    !"module-descriptor".equals(data.reflectionSource)) sources.add("module-descriptor");
+            record.add("sources", sources);
+            record.addProperty("reflectedFieldCount", reflectedLayoutFieldCount(data));
+            record.addProperty("layoutCoverage", reflectedLayoutFieldCount(data) > 0 ? "reflected-subset" : "opaque");
+            BehaviorClassMetadata behavior = behaviorContextEvidence.classesByTypeId.get(normalizeTypeId(data.typeId));
+            if (behavior != null) {
+                record.addProperty("behaviorExposedName", behavior.name);
+                record.addProperty("behaviorNativeSize", behavior.size);
+                record.addProperty("behaviorAlignment", behavior.alignment);
+            }
+            boolean ambiguous = target != null && datatypeConflictingPaths.contains(target.canonicalPathName);
+            record.addProperty("identityAmbiguous", ambiguous);
+            if (ambiguous) {
+                record.addProperty("canonicalDatatypePath", target.canonicalPathName);
+                record.addProperty("identityResolution", "uuid-specific-datatype");
+            }
+            DataType stored = target == null ? null : dataTypeManager.getDataType(target.categoryPath, target.name);
+            record.addProperty("layoutInProgram", stored != null);
+            if (stored instanceof Structure) {
+                Structure structure = (Structure) stored;
+                if (!isGeneratedReflectedDatatype(structure)) record.addProperty("layoutCoverage", "preserved-user-layout");
+                else if (structure.isZeroLength()) record.addProperty("layoutCoverage", "incomplete-declaration");
+                else if (structure.getDescription().contains("NewWorld 3-26 native ABI, verified callback offsets")) {
+                    record.addProperty("layoutCoverage", "verified-native-profile");
+                }
+                record.addProperty("programSize", structure.isZeroLength() ? 0 : structure.getLength());
+                record.addProperty("programAlignment", structure.getAlignment());
+                JsonArray fields = new JsonArray();
+                for (DataTypeComponent component : structure.getDefinedComponents()) {
+                    JsonObject field = new JsonObject();
+                    field.addProperty("name", component.getFieldName());
+                    field.addProperty("offset", component.getOffset());
+                    field.addProperty("length", component.getLength());
+                    field.addProperty("type", component.getDataType().getPathName());
+                    fields.add(field);
+                }
+                record.add("definedFields", fields);
+            }
+            result.add(record);
+        }
         return result;
     }
 
@@ -3686,6 +5382,31 @@ public class AzReflectionRenamer extends GhidraScript {
                     rememberTypeUsage(evidence, genericTypeId, usage);
                 }
                 rememberFieldOwner(evidence, data, element);
+            }
+        }
+        // Generic elements prove serialized value sizes, not container object offsets.
+        for (JsonObject generic : datatypeGenerics.values()) {
+            JsonArray elements = arrayMember(generic, "elements");
+            if (elements == null) continue;
+            for (JsonElement value : elements) {
+                JsonObject member = resolveObject(value, jsonObjectsById);
+                if (member == null || nativeElementIsPointer(member)) continue;
+                ElementData element = new ElementData();
+                element.dataSize = stringMember(member, "dataSize");
+                rememberNativeDataSize(evidence, stringMember(member, "typeId"), element);
+            }
+        }
+        if (behaviorContextEvidence != null) {
+            for (BehaviorClassMetadata metadata : behaviorContextEvidence.classesByTypeId.values()) {
+                if (metadata.size == null || metadata.size <= 0 || metadata.size > 16 * 1024 * 1024) continue;
+                Integer existing = evidence.nativeDataSizesByTypeId.get(metadata.typeId);
+                if (existing == null || existing.equals(metadata.size)) {
+                    evidence.nativeDataSizesByTypeId.put(metadata.typeId, metadata.size);
+                }
+                else {
+                    behaviorContextEvidence.layoutConflicts.add(metadata.typeId + ": SerializeContext size=" +
+                        existing + ", BehaviorContext size=" + metadata.size);
+                }
             }
         }
         summarizeFieldOwnerEvidence(evidence);
@@ -3857,10 +5578,9 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private boolean ownerScopeNamesType(List<String> scope, String targetTypeName) {
-        String safeTargetTypeName = safeTypeName(targetTypeName);
-        return safeTargetTypeName != null &&
-            hasOwner(scope) &&
-            safeTargetTypeName.equals(scope.get(scope.size() - 1));
+        List<String> parts = cppScopeParts(targetTypeName);
+        return !parts.isEmpty() && scope != null && scope.size() >= parts.size() &&
+            scope.subList(scope.size() - parts.size(), scope.size()).equals(parts);
     }
 
     private void rememberStaticOwner(StaticOwner owner) {
@@ -3975,15 +5695,15 @@ public class AzReflectionRenamer extends GhidraScript {
         if (scope == null) {
             return result;
         }
-        for (String part : scope) {
-            String normalizedPart = safeTypeName(part);
-            if (normalizedPart == null) {
-                continue;
+        String qualified = String.join("::", scope);
+        List<String> source = balancedCppDelimiters(qualified) ? cppScopeParts(qualified) : scope;
+        for (String part : source) {
+            for (String normalizedPart : cppScopeParts(part)) {
+                if (!result.isEmpty() && result.get(result.size() - 1).equals(normalizedPart)) {
+                    continue;
+                }
+                result.add(normalizedPart);
             }
-            if (!result.isEmpty() && result.get(result.size() - 1).equals(normalizedPart)) {
-                continue;
-            }
-            result.add(normalizedPart);
         }
         return result;
     }
@@ -4172,6 +5892,36 @@ public class AzReflectionRenamer extends GhidraScript {
                 }
             }
         }
+        if (dataTypeManager != null) {
+            Iterator<DataType> existingTypes = dataTypeManager.getAllDataTypes();
+            while (existingTypes.hasNext()) {
+                DataType type = existingTypes.next();
+                if (!isGeneratedReflectedDatatype(type)) continue;
+                Matcher identity = UUID_RE.matcher(type.getDescription());
+                if (!identity.find()) continue;
+                String category = type.getCategoryPath().getPath();
+                String name = category.equals("/") ? type.getName() : category.substring(1).replace("/", "::") + "::" + type.getName();
+                String known = result.get(normalizeTypeId(identity.group()));
+                if (known == null || (!known.contains("::") && name.contains("::"))) {
+                    rememberRawTypeName(result, identity.group(), name);
+                }
+            }
+        }
+        if (behaviorContextEvidence != null) {
+            for (Map.Entry<String, String> entry : behaviorContextEvidence.typeNamesByTypeId.entrySet()) {
+                String existing = result.get(entry.getKey());
+                if (existing == null || (!existing.contains("::") && entry.getValue().contains("::"))) {
+                    rememberRawTypeName(result, entry.getKey(), entry.getValue());
+                }
+            }
+        }
+        if (moduleEvidence != null) {
+            for (Descriptor descriptor : moduleEvidence.descriptors) {
+                String name = descriptor.azRtti == null ? null : descriptor.azRtti.typeName;
+                if (knownSourceName(name) == null) name = descriptor.componentName;
+                rememberRawTypeName(result, descriptorTypeId(descriptor), name);
+            }
+        }
         return result;
     }
 
@@ -4186,6 +5936,7 @@ public class AzReflectionRenamer extends GhidraScript {
             return;
         }
         result.put(normalizedTypeId, candidate);
+        registerReflectedClassScope(cppScopeParts(candidate));
     }
 
     private boolean shouldKeepExistingRawTypeName(String existing, String candidate) {
@@ -4466,6 +6217,11 @@ public class AzReflectionRenamer extends GhidraScript {
             }
             return null;
         }
+        // Smart pointers reflect their stored pointer, but their template argument is the pointee.
+        if (Set.of("AZStd::shared_ptr", "AZStd::intrusive_ptr", "AZStd::unique_ptr").contains(baseName)
+                && arguments.size() == 1 && arguments.get(0).endsWith("*")) {
+            arguments.set(0, arguments.get(0).substring(0, arguments.get(0).length() - 1));
+        }
         if (!addNonTypeTemplateArguments(arguments, genericInfo)) {
             if (normalizedTypeId != null) {
                 visitingTypeIds.remove(normalizedTypeId);
@@ -4636,17 +6392,25 @@ public class AzReflectionRenamer extends GhidraScript {
                 rawTypeNamesByTypeId,
                 visitingTypeIds);
             if (genericName != null) {
-                return genericName;
+                return memberPointerTypeName(member, genericName);
             }
         }
 
         String typeId = stringMember(member, "typeId");
-        return displayTypeName(
+        return memberPointerTypeName(member, displayTypeName(
             typeId,
             rawTypeName(typeId, rawTypeNamesByTypeId),
             genericInfoByTypeId,
             rawTypeNamesByTypeId,
-            visitingTypeIds);
+            visitingTypeIds));
+    }
+
+    private String memberPointerTypeName(JsonObject member, String name) {
+        JsonElement pointer = member.get("is_pointer");
+        JsonElement flags = member.get("flags");
+        boolean isPointer = pointer != null && !pointer.isJsonNull() ? pointer.getAsBoolean() :
+            flags != null && !flags.isJsonNull() && (flags.getAsInt() & 1) != 0;
+        return name == null ? null : name + (isPointer ? "*" : "");
     }
 
     private int templateArgumentCount(JsonObject genericInfo) {
@@ -4749,10 +6513,14 @@ public class AzReflectionRenamer extends GhidraScript {
         String sourceName,
         Map<String, String> rawTypeNamesByTypeId) {
         String knownSourceName = knownSourceName(sourceName);
+        String rawName = rawTypeName(typeId, rawTypeNamesByTypeId);
+        if (knownSourceName(rawName) != null && rawName.contains("::") &&
+            (knownSourceName == null || !knownSourceName.contains("::")) && balancedCppDelimiters(rawName)) {
+            return rawName;
+        }
         if (knownSourceName != null) {
             return knownSourceName;
         }
-        String rawName = rawTypeName(typeId, rawTypeNamesByTypeId);
         if (knownSourceName(rawName) != null) {
             return rawName;
         }
@@ -4906,7 +6674,78 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private String serializedTypeName(String typeName) {
-        return safeTypeName(typeName);
+        List<String> parts = cppScopeParts(typeName);
+        return parts.isEmpty() ? null : String.join("::", parts);
+    }
+
+    private ArrayList<String> cppScopeParts(String name) {
+        ArrayList<String> parts = new ArrayList<>();
+        if (name == null || name.trim().isEmpty()) return parts;
+        String value = name.trim().replaceAll("\\b(?:class|struct|enum)\\s+", "");
+        while (value.startsWith("::")) value = value.substring(2);
+        if (value.isEmpty()) return parts;
+        // Operator angle brackets are punctuation, not template delimiters.
+        Map<String, String> operators = new LinkedHashMap<>();
+        Matcher operatorMatcher = ANGLE_OPERATOR_RE.matcher(value);
+        StringBuffer protectedValue = new StringBuffer();
+        int tokenNumber = 0;
+        while (operatorMatcher.find()) {
+            String token;
+            do { token = "__az_reflection_operator_" + tokenNumber++ + "__"; }
+            while (value.contains(token));
+            operators.put(token, "operator" + operatorMatcher.group(1));
+            operatorMatcher.appendReplacement(protectedValue, token);
+        }
+        operatorMatcher.appendTail(protectedValue);
+        if (!balancedCppDelimiters(protectedValue.toString())) {
+            // Some runtime names are truncated by the game's fixed-size name buffer.
+            // Keep the observed name atomic; Ghidra otherwise falls back to splitting every ::.
+            unparsedTypeNames.add(name);
+            parts.add(safeTypeName(value));
+            return parts;
+        }
+        // Ghidra keeps :: inside templates and function signatures within one path entry.
+        for (String part : SymbolPathParser.parse(protectedValue.toString(), false)) {
+            for (Map.Entry<String, String> operator : operators.entrySet()) {
+                part = part.replace(operator.getKey(), operator.getValue());
+            }
+            String safe = safeTypeName(part);
+            if (safe != null) parts.add(safe);
+        }
+        return parts;
+    }
+
+    private boolean balancedCppDelimiters(String name) {
+        int angles = 0;
+        int parentheses = 0;
+        for (int i = 0; i < name.length(); i++) {
+            switch (name.charAt(i)) {
+                case '<': angles++; break;
+                case '>': if (--angles < 0) return false; break;
+                case '(': parentheses++; break;
+                case ')': if (--parentheses < 0) return false; break;
+                default: break;
+            }
+        }
+        return angles == 0 && parentheses == 0;
+    }
+
+    private void registerReflectedClassScope(List<String> parts) {
+        if (parts.isEmpty()) return;
+        reflectedClassScopePaths.add(String.join("::", parts));
+        for (int i = 1; i < parts.size(); i++) {
+            String prefix = String.join("::", parts.subList(0, i));
+            if (parts.get(i - 1).contains("<")) reflectedClassScopePaths.add(prefix);
+            else reflectedNamespaceScopePaths.add(prefix);
+        }
+    }
+
+    private void indexReflectedClassScopes(Map<String, JsonObject> generics, Map<String, String> names) {
+        for (Map.Entry<String, JsonObject> entry : generics.entrySet()) {
+            String name = displayTypeName(entry.getKey(), rawTypeName(entry.getKey(), names),
+                generics, names, new HashSet<>());
+            registerReflectedClassScope(cppScopeParts(name));
+        }
     }
 
     private void processRttiType(
@@ -4989,12 +6828,12 @@ public class AzReflectionRenamer extends GhidraScript {
         }
     }
 
-    private ArrayList<InferredStaticRttiHelper> inferredStaticRttiHelpers() {
+    private ArrayList<InferredStaticRttiHelper> inferredStaticRttiHelpers() throws CancelledException {
         ArrayList<InferredStaticRttiHelper> result = new ArrayList<>();
         Set<String> seenVtables = new HashSet<>();
         for (Map.Entry<String, ArrayList<Address>> entry :
             definedStringAddressesByValue().entrySet()) {
-
+            monitor.checkCancelled();
             String typeName = safeTypeName(entry.getKey());
             if (!isPlausibleRttiTypeName(typeName)) {
                 continue;
@@ -5019,6 +6858,7 @@ public class AzReflectionRenamer extends GhidraScript {
         String typeName,
         Address stringAddress) {
 
+        if (!isProgramAddress(stringAddress)) return null;
         for (long delta = 8; delta <= 0x80; delta += 8) {
             Address vtableAddress = absoluteAddress(stringAddress.getOffset() - delta);
             if (!isProgramAddress(vtableAddress)) {
@@ -5044,6 +6884,7 @@ public class AzReflectionRenamer extends GhidraScript {
         Address vtableAddress,
         Address typeNameAddress) {
 
+        if (!isProgramAddress(vtableAddress) || !isProgramAddress(typeNameAddress)) return false;
         Address getTypeName = readPointer(vtableAddress.add(8));
         if (!isExecutableAddress(getTypeName)) {
             return false;
@@ -5174,6 +7015,81 @@ public class AzReflectionRenamer extends GhidraScript {
         return count;
     }
 
+    private void processSerializeFactoryVtables(List<ClassData> classData, ActionSink actions) throws Exception {
+        // SerializeContext.h IObjectFactory: destructor, Create(const char*), Destroy(void*).
+        // These are dispatch-interface aliases; the concrete factory may be shared or custom.
+        List<String> scope = List.of("AZ", "SerializeContext", "IObjectFactory");
+        String[] names = {null, "Create", "Destroy"};
+        Set<Address> seenObjects = new HashSet<>(), seenTables = new HashSet<>();
+        Set<String> seenFunctions = new HashSet<>();
+        for (ClassData data : classData) {
+            monitor.checkCancelled();
+            String captured = data.objects.get("factory");
+            if (captured == null) continue;
+            Address object = parseCaptureAddress(captured);
+            if (object == null || !seenObjects.add(object)) continue;
+            Address table = readPointer(object);
+            JsonObject action = new JsonObject();
+            action.addProperty("kind", "serialize_factory_vtable");
+            action.addProperty("address", captured);
+            action.addProperty("typeId", data.typeId);
+            action.addProperty("owner", data.targetTypeName);
+            action.addProperty("interface", String.join("::", scope));
+            Address[] slots = new Address[3];
+            String reason = null;
+            if (!supportsContainerPointerLayout()) reason = "unsupported-factory-pointer-layout";
+            else if (!isProgramAddress(object) || isExecutableAddress(object) || !isProgramAddress(table) ||
+                isExecutableAddress(table) || (table.getOffset() & 7) != 0) reason = "factory-vtable-not-in-program";
+            else {
+                for (int slot = 0; slot < slots.length; slot++) {
+                    slots[slot] = readPointer(table.add(slot * 8));
+                    if (!isExecutableAddress(slots[slot])) { reason = "factory-vtable-invalid-slot-" + slot; break; }
+                    Function containing = currentProgram.getFunctionManager().getFunctionContaining(slots[slot]);
+                    Instruction instruction = currentProgram.getListing().getInstructionContaining(slots[slot]);
+                    if ((containing != null && !containing.getEntryPoint().equals(slots[slot])) ||
+                        (instruction != null && !instruction.getAddress().equals(slots[slot]))) {
+                        reason = "factory-vtable-slot-not-function-entry-" + slot;
+                        break;
+                    }
+                }
+            }
+            if (reason != null) {
+                action.addProperty("reason", reason);
+                action.addProperty("applied", false);
+                actions.add(action);
+                continue;
+            }
+            if (!seenTables.add(table)) continue;
+            action.addProperty("vtable", formatAddress(table));
+            action.addProperty("reason", "validated-factory-interface; concrete-type-unresolved");
+            action.addProperty("applied", false);
+            JsonArray slotAddresses = new JsonArray();
+            for (Address slot : slots) slotAddresses.add(formatAddress(slot));
+            action.add("slots", slotAddresses);
+            actions.add(action);
+            registerReflectedClassScope(scope);
+            for (int slot = 1; slot < slots.length; slot++) {
+                String address = formatAddress(slots[slot]);
+                if (!seenFunctions.add(address + "|" + names[slot])) continue;
+                JsonObject functionAction = new JsonObject();
+                functionAction.addProperty("kind", "serialize_factory_function_alias");
+                functionAction.addProperty("address", address);
+                functionAction.addProperty("name", fullName(scope, names[slot]));
+                functionAction.addProperty("vtable", formatAddress(table));
+                functionAction.addProperty("slot", slot);
+                functionAction.addProperty("evidence", "captured IObjectFactory pointer; source-order interface; validated native entries");
+                Function function = currentProgram.getFunctionManager().getFunctionAt(slots[slot]);
+                if (function == null && applyRenames) function = createMissingFunction(slots[slot], "FUN_" + slots[slot], functionAction);
+                boolean applied = false;
+                if (applyRenames && function == null) functionAction.addProperty("reason", "function-create-failed");
+                else if (applyRenames) applied = ensureLabel(slots[slot], scope, names[slot], functionAction);
+                functionAction.addProperty("applied", applied);
+                functionAction.addProperty("wouldApply", !applyRenames);
+                actions.add(functionAction);
+            }
+        }
+    }
+
     private void cleanupRepeatedFunctionNamespaces(ActionSink actions) throws Exception {
         FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);
         while (functions.hasNext()) {
@@ -5202,12 +7118,10 @@ public class AzReflectionRenamer extends GhidraScript {
                 actions.add(action);
                 continue;
             }
-            if (!reserveTargetName(targetName, address, action, actions)) {
-                continue;
-            }
+            recordTargetNameAddress(targetName, address, action);
 
             boolean applied = false;
-            if (applyRenames && !function.getName(true).equals(targetName)) {
+            if (applyRenames) {
                 applied = applyFunctionRename(function, normalizedScope, localName, action);
                 if (!applied && action.has("reason")) {
                     action.addProperty("applied", false);
@@ -5216,12 +7130,14 @@ public class AzReflectionRenamer extends GhidraScript {
                 }
             }
             action.addProperty("applied", applied);
-            if (!applyRenames && !function.getName(true).equals(targetName)) {
+            if (!applyRenames) {
                 action.addProperty("wouldApply", true);
                 action.addProperty("reason", "dry-run");
             }
             actions.add(action);
         }
+        cleanupTemplateLabelNamespaces(actions);
+        pruneEmptyTemplateScopeFragments(actions);
     }
 
     private void processMbGetTypeNameFunctions(
@@ -5230,23 +7146,13 @@ public class AzReflectionRenamer extends GhidraScript {
 
         Map<String, SlotGroup> groups = new HashMap<>();
         Set<String> seen = new HashSet<>();
-        DataIterator iterator = currentProgram.getListing().getDefinedData(true);
-        while (iterator.hasNext()) {
+        for (var entry : reflectionStrings().mbTypeNames.entrySet()) {
             monitor.checkCancelled();
-            Data data = iterator.next();
-            String text = dataStringValue(data);
-            if (text == null || !text.contains("MB::GetTypeName<class ")) {
-                continue;
-            }
-
-            Matcher matcher = MB_GET_TYPE_NAME_SIGNATURE_RE.matcher(text);
-            while (matcher.find()) {
-                String typeName = safeTypeName(matcher.group("type"));
-                if (typeName == null) {
-                    continue;
-                }
+            String typeName = serializedTypeName(entry.getKey());
+            if (typeName == null) continue;
+            for (Address stringAddress : entry.getValue()) {
                 processMbGetTypeNameReferences(
-                    data.getAddress(),
+                    stringAddress,
                     typeName,
                     groups,
                     seen,
@@ -5297,40 +7203,56 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private String dataStringValue(Data data) {
+        if (!data.hasStringValue()) return null;
         Object value = data.getValue();
-        if (value instanceof String) {
-            return (String)value;
-        }
-        return value == null ? null : value.toString();
+        return value instanceof String ? (String)value : null;
     }
 
-    private Map<String, ArrayList<Address>> definedStringAddressesByValue() {
-        if (definedStringAddressesByValue != null) {
-            return definedStringAddressesByValue;
-        }
+    private static final class ReflectionStrings {
+        final Map<String, ArrayList<Address>> byValue = new LinkedHashMap<>();
+        final Map<String, ArrayList<Address>> mbTypeNames = new LinkedHashMap<>();
+        final Map<String, ArrayList<Address>> coreTypeIds = new LinkedHashMap<>();
+    }
 
-        definedStringAddressesByValue = new HashMap<>();
+    private Map<String, ArrayList<Address>> definedStringAddressesByValue() throws CancelledException {
+        return reflectionStrings().byValue;
+    }
+
+    private ReflectionStrings reflectionStrings() throws CancelledException {
+        monitor.checkCancelled();
+        if (reflectionStrings != null) return reflectionStrings;
+
+        ReflectionStrings index = new ReflectionStrings();
+        Set<String> coreTypeIds = coreRttiCastTargetsByTypeId().keySet();
         DataIterator iterator = currentProgram.getListing().getDefinedData(true);
         while (iterator.hasNext()) {
-            try {
-                monitor.checkCancelled();
-            }
-            catch (CancelledException ignored) {
-                break;
-            }
+            monitor.checkCancelled();
             Data data = iterator.next();
             String text = dataStringValue(data);
-            if (text == null || text.isEmpty() || text.length() > 512) {
-                continue;
+            if (text == null || text.isEmpty()) continue;
+            Address address = data.getAddress();
+            if (text.length() <= 512) indexStringAddress(index.byValue, text, address);
+            if (text.contains("MB::GetTypeName<")) {
+                Matcher matcher = MB_GET_TYPE_NAME_SIGNATURE_RE.matcher(text);
+                while (matcher.find()) {
+                    monitor.checkCancelled();
+                    indexStringAddress(index.mbTypeNames, matcher.group("type"), address);
+                }
             }
-            ArrayList<Address> addresses = definedStringAddressesByValue.get(text);
-            if (addresses == null) {
-                addresses = new ArrayList<>();
-                definedStringAddressesByValue.put(text, addresses);
+            Matcher matcher = UUID_RE.matcher(text);
+            while (matcher.find()) {
+                monitor.checkCancelled();
+                String typeId = normalizeTypeId(matcher.group());
+                if (coreTypeIds.contains(typeId)) indexStringAddress(index.coreTypeIds, typeId, address);
             }
-            addresses.add(data.getAddress());
         }
-        return definedStringAddressesByValue;
+        monitor.checkCancelled();
+        reflectionStrings = index;
+        return index;
+    }
+
+    private static void indexStringAddress(Map<String, ArrayList<Address>> index, String key, Address address) {
+        index.computeIfAbsent(key, ignored -> new ArrayList<>()).add(address);
     }
 
     private void processCoreRttiCastHelpers(
@@ -5339,24 +7261,12 @@ public class AzReflectionRenamer extends GhidraScript {
 
         Map<String, CoreRttiCastTarget> targets = coreRttiCastTargetsByTypeId();
         Set<String> seen = new HashSet<>();
-        DataIterator iterator = currentProgram.getListing().getDefinedData(true);
-        while (iterator.hasNext()) {
+        for (var entry : reflectionStrings().coreTypeIds.entrySet()) {
             monitor.checkCancelled();
-            Data data = iterator.next();
-            String text = dataStringValue(data);
-            if (text == null) {
-                continue;
-            }
-
-            Matcher matcher = UUID_RE.matcher(text);
-            while (matcher.find()) {
-                CoreRttiCastTarget target =
-                    targets.get(normalizeTypeId(matcher.group()));
-                if (target == null) {
-                    continue;
-                }
+            CoreRttiCastTarget target = targets.get(entry.getKey());
+            for (Address stringAddress : entry.getValue()) {
                 processCoreRttiCastReferences(
-                    data.getAddress(),
+                    stringAddress,
                     target,
                     seen,
                     functionSeen,
@@ -5480,14 +7390,12 @@ public class AzReflectionRenamer extends GhidraScript {
         action.addProperty("targetTypeId", target.typeId);
         action.addProperty("oldName", function.getName(true));
 
-        if (!reserveTargetName(targetName, address, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, address, action);
 
         boolean renamed = false;
         boolean prototypeApplied = false;
         if (applyRenames) {
-            if (!function.getName(true).equals(targetName)) {
+            if (!functionHasTargetName(function, scope, localName)) {
                 renamed = applyFunctionRename(function, scope, localName, action);
                 if (!renamed && action.has("reason")) {
                     action.addProperty("applied", false);
@@ -5495,19 +7403,16 @@ public class AzReflectionRenamer extends GhidraScript {
                     return;
                 }
             }
-            prototypeApplied = applyCoreRttiCastPrototype(function, target, action);
-            if (!prototypeApplied && action.has("reason")) {
-                action.addProperty("applied", renamed);
-                actions.add(action);
-                return;
-            }
         }
+        prototypeApplied = applyCoreRttiCastPrototype(function, target, action);
 
-        action.addProperty("applied", renamed || prototypeApplied);
-        action.addProperty("prototypeApplied", prototypeApplied);
-        if (!applyRenames && !function.getName(true).equals(targetName)) {
+        action.addProperty("applied", applyRenames && (renamed || prototypeApplied));
+        action.addProperty("prototypeApplied", applyRenames && prototypeApplied);
+        if (!applyRenames && (!functionHasTargetName(function, scope, localName) || prototypeApplied)) {
             action.addProperty("wouldApply", true);
-            action.addProperty("reason", "dry-run");
+            if (!action.has("reason") || "already-current".equals(stringMember(action, "reason"))) {
+                action.addProperty("reason", "dry-run");
+            }
         }
         actions.add(action);
     }
@@ -5525,19 +7430,8 @@ public class AzReflectionRenamer extends GhidraScript {
         }
 
         try {
-            boolean changed = false;
-            if (!sameDataType(function.getReturnType(), returnPointer)) {
-                function.setReturnType(returnPointer, SourceType.USER_DEFINED);
-                changed = true;
-            }
-            changed |= replaceLeadingParameters(
-                function,
-                new String[] { "context" },
-                new DataType[] { reflectContextPointer });
-            if (!changed) {
-                action.addProperty("reason", "already-current");
-            }
-            return changed;
+            return updateReflectionSignature(function, new String[] { "context" },
+                new DataType[] { reflectContextPointer }, returnPointer, action);
         }
         catch (Exception error) {
             action.addProperty("reason", "core-rtti-cast-prototype-failed");
@@ -6142,7 +8036,7 @@ public class AzReflectionRenamer extends GhidraScript {
         addModuleDescriptorEvidence(action);
 
         if (actions.keepsFullActions()) {
-            action.add("oldNames", oldNames(candidate.vtableAddress));
+            actions.captureOldNames(candidate.vtableAddress, action);
         }
 
         if (vtableName == null) {
@@ -6166,9 +8060,7 @@ public class AzReflectionRenamer extends GhidraScript {
         String targetName = fullName(scope, vtableName.localName);
         action.addProperty("name", targetName);
         action.addProperty("semanticVtable", vtableName.semanticName);
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
 
         boolean applied = false;
         if (applyRenames) {
@@ -6341,11 +8233,9 @@ public class AzReflectionRenamer extends GhidraScript {
         action.addProperty("address", jsonAddress);
         action.addProperty("name", targetName);
         addModuleDescriptorEvidence(action);
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
         if (actions.keepsFullActions()) {
-            action.add("oldNames", oldNames(address));
+            actions.captureOldNames(address, action);
         }
         boolean applied = false;
         if (applyRenames) {
@@ -6392,7 +8282,7 @@ public class AzReflectionRenamer extends GhidraScript {
         action.addProperty("duplicateNameAllowed", true);
         addModuleDescriptorEvidence(action);
         if (actions.keepsFullActions()) {
-            action.add("oldNames", oldNames(thunk.address));
+            actions.captureOldNames(thunk.address, action);
         }
 
         boolean applied = false;
@@ -6411,7 +8301,7 @@ public class AzReflectionRenamer extends GhidraScript {
                 return;
             }
             action.addProperty("oldName", function.getName(true));
-            if (!function.getName(true).equals(targetName)) {
+            if (!functionHasTargetName(function, scope, localName)) {
                 applied = applyFunctionRename(function, scope, localName, action);
             }
         }
@@ -6700,9 +8590,7 @@ public class AzReflectionRenamer extends GhidraScript {
             actions.add(action);
             return;
         }
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
 
         Function function = currentProgram.getFunctionManager().getFunctionAt(address);
         boolean created = false;
@@ -6723,11 +8611,11 @@ public class AzReflectionRenamer extends GhidraScript {
         action.addProperty("oldName", function.getName(true));
         action.addProperty("created", created);
         boolean applied = false;
-        if (applyRenames && !function.getName(true).equals(targetName)) {
+        if (applyRenames && !functionHasTargetName(function, targetScope, targetLocal)) {
             applied = applyFunctionRename(function, targetScope, targetLocal, action);
         }
         action.addProperty("applied", applied);
-        if (!applyRenames && !function.getName(true).equals(targetName)) {
+        if (!applyRenames && !functionHasTargetName(function, targetScope, targetLocal)) {
             action.addProperty("wouldApply", true);
             action.addProperty("reason", "dry-run");
         }
@@ -6809,9 +8697,7 @@ public class AzReflectionRenamer extends GhidraScript {
         action.addProperty("kind", "module_descriptor_reflect_thunk_target");
         action.addProperty("address", address);
         action.addProperty("name", targetName);
-        if (!reserveTargetName(targetName, address, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, address, action);
         action.addProperty("oldName", target.getName(true));
         boolean applied = false;
         if (applyRenames && !target.getName(true).equals(targetName)) {
@@ -6883,6 +8769,7 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private Address directJumpTarget(Address address) {
+        if (!isExecutableAddress(address)) return null;
         Instruction instruction = currentProgram.getListing().getInstructionAt(address);
         if (instruction == null || !isDirectJump(instruction)) {
             return null;
@@ -6895,6 +8782,7 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private ThisAdjustThunk thisAdjustThunk(Address address) {
+        if (!isExecutableAddress(address)) return null;
         Instruction first = currentProgram.getListing().getInstructionAt(address);
         Integer adjustment = subRcxImmediate(first);
         if (adjustment == null) {
@@ -6965,12 +8853,10 @@ public class AzReflectionRenamer extends GhidraScript {
             actions.add(action);
             return;
         }
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
 
         if (actions.keepsFullActions()) {
-            action.add("oldNames", oldNames(address));
+            actions.captureOldNames(address, action);
         }
         boolean applied = false;
         if (applyRenames) {
@@ -7045,12 +8931,10 @@ public class AzReflectionRenamer extends GhidraScript {
             actions.add(action);
             return;
         }
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
 
         if (actions.keepsFullActions()) {
-            action.add("oldNames", oldNames(address));
+            actions.captureOldNames(address, action);
         }
         boolean applied = false;
         if (applyRenames) {
@@ -7142,25 +9026,48 @@ public class AzReflectionRenamer extends GhidraScript {
         }
     }
 
-    private void processReflectedDatatypes(
+    private Map<String, Structure> processReflectedDatatypes(
         List<ClassData> classData,
         ActionSink actions) throws Exception {
 
         List<ClassData> canonicalClassData = canonicalClassDataByTypeId(classData);
+        Map<String, Set<String>> ownersByPath = new LinkedHashMap<>();
+        datatypeConflictingPaths.clear();
+        for (ClassData data : canonicalClassData) {
+            DatatypeTarget target = datatypeTarget(data);
+            if (target != null) {
+                ownersByPath.computeIfAbsent(datatypePathName(target), key -> new HashSet<>()).add(normalizeTypeId(data.typeId));
+                rememberSplitTemplateScopes(target.scope);
+            }
+        }
+        ownersByPath.forEach((path, owners) -> { if (owners.size() > 1) datatypeConflictingPaths.add(path); });
         LinkedHashMap<String, Structure> declaredStructures = new LinkedHashMap<>();
-        cleanupStaleNestedReflectedDatatypes(canonicalClassData, actions);
-        if (applyRenames) {
-            for (ClassData data : canonicalClassData) {
-                String typeId = normalizeTypeId(data.typeId);
-                if (typeId == null || declaredStructures.containsKey(typeId)) {
-                    continue;
-                }
-                Structure structure = declareReflectedDatatype(data);
-                if (structure != null) {
-                    declaredStructures.put(typeId, structure);
-                }
-                if (monitor.isCancelled()) {
-                    return;
+        repairQualifiedReflectionNames(actions);
+        for (ClassData data : canonicalClassData) {
+            monitor.checkCancelled();
+            String typeId = normalizeTypeId(data.typeId);
+            if (typeId == null || declaredStructures.containsKey(typeId)) continue;
+            DatatypeTarget target = datatypeTarget(data);
+            DataType before = target == null ? null : dataTypeManager.getDataType(target.categoryPath, target.name);
+            int beforeSize = before == null ? 0 : before.getLength();
+            int beforeAlignment = before == null ? 0 : before.getAlignment();
+            Structure structure = declareReflectedDatatype(data);
+            if (structure != null) {
+                declaredStructures.put(typeId, structure);
+                if (before == null || structure.getLength() > beforeSize || structure.getAlignment() != beforeAlignment) {
+                    JsonObject action = new JsonObject();
+                    action.addProperty("kind", "datatype_declaration");
+                    action.addProperty("ownerTypeId", data.typeId);
+                    action.addProperty("name", data.targetTypeName);
+                    action.addProperty("datatypePath", datatypePathName(target));
+                    if (datatypeConflictingPaths.contains(target.canonicalPathName)) {
+                        action.addProperty("identityResolution", "uuid-specific-datatype");
+                        action.addProperty("canonicalDatatypePath", target.canonicalPathName);
+                    }
+                    action.addProperty("layoutSize", structure.getLength());
+                    action.addProperty("applied", applyRenames);
+                    action.addProperty("wouldApply", !applyRenames);
+                    actions.add(action);
                 }
             }
         }
@@ -7168,18 +9075,29 @@ public class AzReflectionRenamer extends GhidraScript {
         Map<String, Structure> previousDeclaredStructures = declaredStructuresByTypeId;
         declaredStructuresByTypeId = declaredStructures;
         try {
+            monitor.initialize(canonicalClassData.size());
             for (ClassData data : canonicalClassData) {
-                processReflectedDatatype(data, actions);
-                if (monitor.isCancelled()) {
-                    return;
+                monitor.checkCancelled();
+                monitor.setMessage("Datatype layout: " + data.targetTypeName);
+                DatatypeTarget target = datatypeTarget(data);
+                if (target != null && datatypeConflictingPaths.contains(datatypePathName(target))) {
+                    JsonObject action = new JsonObject();
+                    action.addProperty("kind", "datatype_structure");
+                    action.addProperty("ownerTypeId", data.typeId);
+                    action.addProperty("name", data.targetTypeName);
+                    action.addProperty("applied", false);
+                    action.addProperty("reason", "ambiguous-datatype-path; distinct-UUIDs-preserved");
+                    actions.add(action);
                 }
+                else if (!processNativeDatatype(data, actions)) processReflectedDatatype(data, actions);
+                monitor.incrementProgress(1);
+                monitor.checkCancelled();
             }
         }
         finally {
             declaredStructuresByTypeId = previousDeclaredStructures;
         }
-
-        processMemberFunctionThisParameters(classData, declaredStructures, actions);
+        return declaredStructures;
     }
 
     private void ensureCoreReflectionDatatypes(ActionSink actions) throws Exception {
@@ -7206,7 +9124,7 @@ public class AzReflectionRenamer extends GhidraScript {
         }
 
         DataType existing = dataTypeManager.getDataType(categoryPath, name);
-        if (existing instanceof Structure && !isCoreReflectionDatatype(existing)) {
+        if (existing instanceof Structure && !isCoreReflectionDatatype(existing) && !isEmptyGhidraClassPlaceholder(existing)) {
             action.addProperty("applied", false);
             action.addProperty("reason", "existing-user-datatype");
             actions.add(action);
@@ -7229,6 +9147,7 @@ public class AzReflectionRenamer extends GhidraScript {
             return;
         }
         if (!applyRenames) {
+            previewCoreDatatypes.put(name, structure);
             action.addProperty("applied", false);
             action.addProperty("wouldApply", true);
             action.addProperty("reason", "dry-run");
@@ -7236,11 +9155,11 @@ public class AzReflectionRenamer extends GhidraScript {
             return;
         }
 
-        dataTypeManager.addDataType(
-            structure,
-            existing == null
-                ? DataTypeConflictHandler.DEFAULT_HANDLER
-                : DataTypeConflictHandler.REPLACE_HANDLER);
+        if (existing instanceof Structure) {
+            ((Structure) existing).replaceWith(structure);
+            existing.setDescription(structure.getDescription());
+        }
+        else dataTypeManager.addDataType(structure, DataTypeConflictHandler.DEFAULT_HANDLER);
         action.addProperty("applied", true);
         actions.add(action);
     }
@@ -7293,10 +9212,20 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private Structure coreReflectionDatatype(String name) {
+        if (!applyRenames && previewCoreDatatypes.containsKey(name)) return previewCoreDatatypes.get(name);
         DataType dataType = dataTypeManager.getDataType(
             new CategoryPath(CategoryPath.ROOT, "AZ"),
             name);
-        return dataType instanceof Structure ? (Structure) dataType : null;
+        if (dataType instanceof Structure) return (Structure) dataType;
+        if (dataType == null && !applyRenames) {
+            switch (name) {
+                case "ReflectContext": return coreReflectionStructure(name, 0x10, null);
+                case "SerializeContext":
+                case "BehaviorContext": return coreReflectionStructure(name, 0x10, "ReflectContext");
+                case "ComponentDescriptor": return coreReflectionStructure(name, 0x8, null);
+            }
+        }
+        return null;
     }
 
     private DataType coreReflectionPointerType(String name) {
@@ -7347,14 +9276,6 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         action.addProperty("function", function.getName(true));
 
-        if (!applyRenames) {
-            action.addProperty("applied", false);
-            action.addProperty("wouldApply", true);
-            action.addProperty("reason", "dry-run");
-            actions.add(action);
-            return;
-        }
-
         DataType reflectContextPointer = coreReflectionPointerType("ReflectContext");
         if (reflectContextPointer == null) {
             action.addProperty("applied", false);
@@ -7364,14 +9285,8 @@ public class AzReflectionRenamer extends GhidraScript {
         }
 
         try {
-            boolean changed = replaceLeadingParameters(
-                function,
-                new String[] { "reflection" },
-                new DataType[] { reflectContextPointer });
-            action.addProperty("applied", changed);
-            if (!changed) {
-                action.addProperty("reason", "already-current");
-            }
+            updateReflectionSignature(function, new String[] { "reflection" },
+                new DataType[] { reflectContextPointer }, null, action);
         }
         catch (Exception error) {
             action.addProperty("applied", false);
@@ -7399,14 +9314,6 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         action.addProperty("function", function.getName(true));
 
-        if (!applyRenames) {
-            action.addProperty("applied", false);
-            action.addProperty("wouldApply", true);
-            action.addProperty("reason", "dry-run");
-            actions.add(action);
-            return;
-        }
-
         DataType descriptorPointer = coreReflectionPointerType("ComponentDescriptor");
         DataType reflectContextPointer = coreReflectionPointerType("ReflectContext");
         if (descriptorPointer == null || reflectContextPointer == null) {
@@ -7417,14 +9324,8 @@ public class AzReflectionRenamer extends GhidraScript {
         }
 
         try {
-            boolean changed = replaceLeadingParameters(
-                function,
-                new String[] { "this", "reflection" },
-                new DataType[] { descriptorPointer, reflectContextPointer });
-            action.addProperty("applied", changed);
-            if (!changed) {
-                action.addProperty("reason", "already-current");
-            }
+            updateReflectionSignature(function, new String[] { "this", "reflection" },
+                new DataType[] { descriptorPointer, reflectContextPointer }, null, action);
         }
         catch (Exception error) {
             action.addProperty("applied", false);
@@ -7454,194 +9355,448 @@ public class AzReflectionRenamer extends GhidraScript {
         return null;
     }
 
-    private boolean replaceLeadingParameters(
+    private boolean updateReflectionSignature(
         Function function,
         String[] names,
-        DataType[] types) throws Exception {
+        DataType[] types,
+        DataType returnType,
+        JsonObject action) throws Exception {
 
-        Parameter[] existing = function.getParameters();
-        boolean alreadyCurrent = existing.length >= names.length;
-        if (alreadyCurrent) {
-            for (int i = 0; i < names.length; i++) {
-                if (!names[i].equals(existing[i].getName()) ||
-                    !sameDataType(existing[i].getDataType(), types[i])) {
-                    alreadyCurrent = false;
-                    break;
-                }
-            }
-        }
-        if (alreadyCurrent) {
+        action.addProperty("signatureChecked", true);
+        ReflectionSignaturePlan plan = planReflectionSignature(function, names, types, returnType, action);
+        action.addProperty("applied", false);
+        if (plan.skipReason != null) {
+            action.addProperty("reason", plan.skipReason);
             return false;
         }
-
-        int length = Math.max(existing.length, names.length);
-        Parameter[] updated = new Parameter[length];
-        for (int i = 0; i < length; i++) {
-            if (i < names.length) {
-                updated[i] = new ParameterImpl(names[i], types[i], currentProgram);
-            }
-            else {
-                updated[i] = existing[i];
-            }
+        if (!plan.changed) {
+            action.addProperty("reason", "already-current");
+            return false;
         }
-        function.replaceParameters(
-            FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
-            true,
-            SourceType.USER_DEFINED,
-            updated);
+        if (!applyRenames) {
+            action.addProperty("wouldApply", true);
+            action.addProperty("reason", "dry-run");
+            return true;
+        }
+        function.updateFunction(null, plan.returnValue, plan.parameters,
+            plan.customStorage ? FunctionUpdateType.CUSTOM_STORAGE : FunctionUpdateType.DYNAMIC_STORAGE_FORMAL_PARAMS,
+            false, SourceType.USER_DEFINED);
+        action.addProperty("applied", true);
         return true;
     }
 
-    private void cleanupStaleNestedReflectedDatatypes(
-        List<ClassData> canonicalClassData,
-        ActionSink actions) throws Exception {
+    private ReflectionSignaturePlan planReflectionSignature(
+        Function function, String[] names, DataType[] types, DataType returnType, JsonObject action) throws Exception {
 
-        LinkedHashSet<String> reflectedTypeNames = new LinkedHashSet<>();
-        LinkedHashSet<String> canonicalPaths = new LinkedHashSet<>();
-        for (ClassData data : canonicalClassData) {
-            DatatypeTarget target = datatypeTarget(data);
-            if (target == null) {
-                continue;
-            }
-            reflectedTypeNames.add(target.name);
-            canonicalPaths.add(datatypePathName(target));
+        if (names.length != types.length || names.length == 0) {
+            throw new IllegalArgumentException("Reflection parameter names and types must have matching nonzero lengths");
         }
-
-        Iterator<DataType> iterator = dataTypeManager.getAllDataTypes();
-        ArrayList<DataType> staleDatatypes = new ArrayList<>();
-        LinkedHashMap<String, CategoryPath> staleCategoryPaths = new LinkedHashMap<>();
-        rememberConflictingDatatypeCategories(staleCategoryPaths, canonicalPaths);
-        while (iterator.hasNext()) {
-            DataType dataType = iterator.next();
-            if (!(dataType instanceof Structure)) {
-                continue;
-            }
-            if (!reflectedTypeNames.contains(dataType.getName()) ||
-                !isGeneratedReflectedDatatype(dataType)) {
-                continue;
-            }
-            if (canonicalPaths.contains(dataType.getPathName())) {
-                continue;
-            }
-            staleDatatypes.add(dataType);
-            rememberCategoryPathAndAncestors(staleCategoryPaths, dataType.getCategoryPath());
-        }
-
-        for (DataType dataType : staleDatatypes) {
-            JsonObject action = new JsonObject();
-            action.addProperty("kind", "stale_datatype_cleanup");
-            action.addProperty("name", dataType.getName());
-            action.addProperty("datatypePath", dataType.getPathName());
-            if (!applyRenames) {
-                action.addProperty("applied", false);
-                action.addProperty("wouldApply", true);
-                action.addProperty("reason", "dry-run");
-                actions.add(action);
-                continue;
-            }
-            try {
-                dataTypeManager.remove(Collections.singletonList(dataType), monitor);
-                action.addProperty("applied", true);
-            }
-            catch (Exception error) {
-                action.addProperty("applied", false);
-                action.addProperty("reason", "remove-failed");
-                action.addProperty("error", error.getMessage());
-            }
-            actions.add(action);
-        }
-
-        cleanupEmptyStaleCategories(staleCategoryPaths, actions);
-    }
-
-    private void rememberConflictingDatatypeCategories(
-        LinkedHashMap<String, CategoryPath> paths,
-        Set<String> canonicalDatatypePaths) {
-
-        for (String pathName : canonicalDatatypePaths) {
-            Category category = dataTypeManager.getCategory(new CategoryPath(pathName));
-            if (category != null) {
-                rememberCategoryAndDescendants(paths, category);
+        for (int i = 0; i < names.length; i++) {
+            if (names[i] == null || names[i].isEmpty() || types[i] == null || types[i].getLength() <= 0) {
+                throw new IllegalArgumentException("Reflection parameters require names and fixed datatypes");
             }
         }
-    }
-
-    private void rememberCategoryAndDescendants(
-        LinkedHashMap<String, CategoryPath> paths,
-        Category category) {
-
-        if (category == null) {
-            return;
-        }
-        CategoryPath path = category.getCategoryPath();
-        if (path != null && !CategoryPath.ROOT.equals(path)) {
-            paths.put(path.getPath(), path);
-        }
-        for (Category child : category.getCategories()) {
-            rememberCategoryAndDescendants(paths, child);
-        }
-    }
-
-    private void rememberCategoryPathAndAncestors(
-        LinkedHashMap<String, CategoryPath> paths,
-        CategoryPath path) {
-
-        CategoryPath current = path;
-        while (current != null && !CategoryPath.ROOT.equals(current)) {
-            paths.put(current.getPath(), current);
-            current = current.getParent();
-        }
-    }
-
-    private void cleanupEmptyStaleCategories(
-        LinkedHashMap<String, CategoryPath> staleCategoryPaths,
-        ActionSink actions) throws Exception {
-
-        ArrayList<CategoryPath> paths = new ArrayList<>(staleCategoryPaths.values());
-        paths.sort((left, right) ->
-            Integer.compare(right.asList().size(), left.asList().size()));
-
-        for (CategoryPath path : paths) {
-            JsonObject action = new JsonObject();
-            action.addProperty("kind", "stale_category_cleanup");
-            action.addProperty("categoryPath", path.getPath());
-
-            if (!applyRenames) {
-                action.addProperty("applied", false);
-                action.addProperty("wouldApply", true);
-                action.addProperty("reason", "dry-run");
-                actions.add(action);
-                continue;
+        ReflectionSignaturePlan plan = new ReflectionSignaturePlan();
+        plan.customStorage = function.hasCustomVariableStorage();
+        ArrayList<Parameter> existing = new ArrayList<>();
+        Parameter automaticThis = null;
+        JsonArray automatic = new JsonArray();
+        for (Parameter parameter : function.getParameters()) {
+            if (parameter.isAutoParameter()) {
+                automatic.add(signatureParameterEvidence(parameter));
+                if (parameter.getAutoParameterType() == AutoParameterType.THIS) automaticThis = parameter;
             }
-
-            Category parent = dataTypeManager.getCategory(path.getParent());
-            if (parent == null) {
-                action.addProperty("applied", false);
-                action.addProperty("reason", "parent-category-missing");
-                actions.add(action);
-                continue;
+            else existing.add(parameter);
+        }
+        boolean materializeThis = names.length == 1 && "this".equals(names[0]) && automaticThis != null &&
+            !sameDataType(automaticThis.getDataType(), types[0]);
+        if (materializeThis) {
+            if (automatic.size() != 1 || function.getReturn().isForcedIndirect() ||
+                existing.stream().anyMatch(Parameter::isForcedIndirect)) {
+                plan.skipReason = "signature-auto-this-type-unresolved";
+                action.addProperty("storageDetail", "Automatic receiver type differs; hidden/indirect ABI requires independent evidence");
+                return plan;
             }
-
-            try {
-                boolean removed = parent.removeEmptyCategory(path.getName(), monitor);
-                action.addProperty("applied", removed);
-                if (!removed) {
-                    action.addProperty("reason", "category-not-empty");
+            for (Symbol symbol : symbols.getSymbols(function)) {
+                if (symbol.getSymbolType() != SymbolType.PARAMETER && "this".equals(symbol.getName()) &&
+                    symbol.getSource() != SourceType.DEFAULT) {
+                    plan.skipReason = "signature-auto-this-name-conflict";
+                    return plan;
                 }
             }
-            catch (Exception error) {
-                action.addProperty("applied", false);
-                action.addProperty("reason", "category-remove-failed");
-                action.addProperty("error", error.getMessage());
+            existing.add(0, automaticThis);
+            plan.customStorage = true;
+            plan.changed = true;
+            action.addProperty("materializedAutomaticThis", true);
+        }
+        action.add("automaticParameters", automatic);
+        action.addProperty("customStoragePreserved", function.hasCustomVariableStorage());
+        action.addProperty("callingConvention", function.getCallingConventionName());
+
+        boolean receiverRequested = "this".equals(names[0]);
+        if (receiverRequested && automaticThis == null && hiddenReturnPrecedesFormals(function, existing)) {
+            // MSVC x64 members pass this in RCX and the return buffer in RDX; the model has them reversed.
+            plan.skipReason = "signature-receiver-hidden-return-order-unresolved";
+            action.addProperty("storageDetail", "Hidden return pointer occupies the receiver register");
+            return plan;
+        }
+        int desiredStart = receiverRequested && automaticThis != null && !materializeThis ? 1 : 0;
+        int existingStart = 0;
+        while (existingStart < existing.size()) {
+            Parameter parameter = existing.get(existingStart);
+            boolean hiddenReturn = Function.RETURN_PTR_PARAM_NAME.equals(parameter.getName());
+            boolean explicitReceiver = !receiverRequested && "this".equals(parameter.getName()) &&
+                parameter.getDataType() instanceof ghidra.program.model.data.Pointer;
+            if (!hiddenReturn && !explicitReceiver) break;
+            existingStart++;
+        }
+        if (automaticThis != null && receiverRequested && !materializeThis) {
+            action.addProperty("thisTypeManagedByClassNamespace", true);
+            action.addProperty("requestedThisType", types[0].getPathName());
+        }
+
+        int desiredCount = names.length - desiredStart;
+        int length = Math.max(existing.size(), existingStart + desiredCount);
+        Set<String> occupied = new HashSet<>();
+        for (Symbol symbol : symbols.getSymbols(function)) {
+            if (symbol.getSymbolType() != SymbolType.PARAMETER && symbol.getSource() != SourceType.DEFAULT) {
+                occupied.add(symbol.getName());
             }
+        }
+        if (!materializeThis) {
+            for (JsonElement value : automatic) occupied.add(value.getAsJsonObject().get("name").getAsString());
+        }
+        for (int i = 0; i < existing.size(); i++) {
+            if (i < existingStart || i >= existingStart + desiredCount) occupied.add(existing.get(i).getName());
+        }
+        JsonArray nameAdjustments = new JsonArray();
+        JsonArray proposed = new JsonArray();
+        for (int i = 0; i < length; i++) {
+            Parameter old = i < existing.size() ? existing.get(i) : null;
+            boolean update = i >= existingStart && i < existingStart + desiredCount;
+            if (!update) {
+                plan.parameters.add(old);
+                proposed.add(signatureParameterEvidence(old));
+                continue;
+            }
+            int desired = i - existingStart + desiredStart;
+            String name = names[desired];
+            for (int suffix = 2; occupied.contains(name); suffix++) name = names[desired] + "_" + suffix;
+            occupied.add(name);
+            if (!name.equals(names[desired])) {
+                JsonObject adjustment = new JsonObject();
+                adjustment.addProperty("requested", names[desired]);
+                adjustment.addProperty("actual", name);
+                adjustment.addProperty("formalOrdinal", i);
+                nameAdjustments.add(adjustment);
+            }
+            VariableStorage storage = plan.customStorage && old != null ? old.getVariableStorage() :
+                VariableStorage.UNASSIGNED_STORAGE;
+            if (materializeThis && storage.isAutoStorage()) {
+                storage = new VariableStorage(currentProgram, storage.getVarnodes());
+            }
+            if (plan.customStorage && (!storage.isValid() || storage.size() != types[desired].getLength())) {
+                plan.skipReason = "signature-custom-storage-unresolved";
+                action.addProperty("storageDetail", "Preserved custom storage cannot hold parameter '" + name + "'");
+                return plan;
+            }
+            ParameterImpl parameter = new ParameterImpl(name, types[desired], storage, currentProgram, SourceType.USER_DEFINED);
+            if (old != null) parameter.setComment(old.getComment());
+            plan.parameters.add(parameter);
+            proposed.add(signatureParameterEvidence(parameter));
+            plan.changed |= old == null || !name.equals(old.getName()) ||
+                !sameDataType(old.getFormalDataType(), types[desired]);
+        }
+        action.add("parameterNameAdjustments", nameAdjustments);
+        action.add("plannedFormalParameters", proposed);
+        if (returnType != null && !sameDataType(function.getReturn().getFormalDataType(), returnType)) {
+            VariableStorage storage = plan.customStorage ? function.getReturn().getVariableStorage() :
+                VariableStorage.UNASSIGNED_STORAGE;
+            if (plan.customStorage && (!storage.isValid() || storage.size() != returnType.getLength() ||
+                function.getReturn().isForcedIndirect())) {
+                plan.skipReason = "signature-custom-return-storage-unresolved";
+                return plan;
+            }
+            plan.returnValue = new ReturnParameterImpl(returnType, storage, currentProgram);
+            plan.changed = true;
+        }
+        assessSignatureStorage(function, plan, action);
+        return plan;
+    }
+
+    private boolean hiddenReturnPrecedesFormals(Function function, List<Parameter> existing) {
+        for (Parameter parameter : function.getParameters()) {
+            if (parameter.isAutoParameter() &&
+                parameter.getAutoParameterType() == AutoParameterType.RETURN_STORAGE_PTR) {
+                return true;
+            }
+        }
+        return !existing.isEmpty() && Function.RETURN_PTR_PARAM_NAME.equals(existing.get(0).getName());
+    }
+
+    private JsonObject signatureParameterEvidence(Parameter parameter) {
+        JsonObject evidence = new JsonObject();
+        evidence.addProperty("name", parameter.getName());
+        evidence.addProperty("type", parameter.getFormalDataType().getPathName());
+        evidence.addProperty("storage", parameter.getVariableStorage().toString());
+        return evidence;
+    }
+
+    private void assessSignatureStorage(Function function, ReflectionSignaturePlan plan, JsonObject action) {
+        ArrayList<VariableStorage> storages = new ArrayList<>();
+        if (plan.customStorage) {
+            for (Parameter parameter : plan.parameters) storages.add(parameter.getVariableStorage());
+        }
+        else {
+            var convention = function.getCallingConvention();
+            if (convention == null) convention = currentProgram.getCompilerSpec().getDefaultCallingConvention();
+            if (convention == null || convention.isErrorPlaceholder()) {
+                plan.skipReason = "signature-calling-convention-unresolved";
+                return;
+            }
+            DataType[] types = new DataType[plan.parameters.size() + 1];
+            types[0] = plan.returnValue == null ? function.getReturn().getFormalDataType() : plan.returnValue.getFormalDataType();
+            for (int i = 0; i < plan.parameters.size(); i++) types[i + 1] = plan.parameters.get(i).getFormalDataType();
+            VariableStorage[] calculated = convention.getStorageLocations(currentProgram, types, true);
+            for (int i = 1; i < calculated.length; i++) storages.add(calculated[i]);
+            Parameter[] current = function.getParameters();
+            if (current.length == storages.size()) {
+                for (int i = 0; i < current.length; i++) {
+                    if (!current[i].getVariableStorage().isValid() && storages.get(i).isValid()) {
+                        plan.changed = true;
+                        action.addProperty("storageRepair", "recompute-invalid-dynamic-parameter-storage");
+                    }
+                }
+            }
+        }
+        JsonArray plannedStorage = new JsonArray();
+        for (VariableStorage storage : storages) plannedStorage.add(storage.toString());
+        action.add("plannedParameterStorage", plannedStorage);
+        if (plan.customStorage) {
+            for (int i = 0; i < storages.size(); i++) {
+                if (!storages.get(i).isValid()) {
+                    plan.skipReason = "signature-custom-storage-unresolved";
+                    return;
+                }
+                for (int j = i + 1; j < storages.size(); j++) {
+                    if (storages.get(i).intersects(storages.get(j))) {
+                        plan.skipReason = "signature-custom-storage-conflict";
+                        return;
+                    }
+                }
+            }
+        }
+        for (Variable local : function.getLocalVariables()) {
+            VariableStorage localStorage = local.getVariableStorage();
+            if (localStorage.isBadStorage()) {
+                plan.skipReason = "signature-invalid-local-storage";
+                action.addProperty("storageDetail", "Local '" + local.getName() + "' needs independent storage evidence");
+                return;
+            }
+            if (local.getFirstUseOffset() != 0) continue;
+            for (VariableStorage storage : storages) {
+                if ((plan.customStorage || localStorage.hasStackStorage() && storage.hasStackStorage()) &&
+                    storage.intersects(localStorage)) {
+                    plan.skipReason = localStorage.hasStackStorage() ? "signature-stack-storage-conflict" :
+                        "signature-custom-local-storage-conflict";
+                    action.addProperty("storageDetail", "Local '" + local.getName() + "' overlaps planned parameter storage");
+                    return;
+                }
+            }
+        }
+    }
+
+    private static class ReflectionSignaturePlan {
+        final List<Parameter> parameters = new ArrayList<>();
+        ReturnParameterImpl returnValue;
+        boolean customStorage;
+        boolean changed;
+        String skipReason;
+    }
+
+    private void repairQualifiedReflectionNames(ActionSink actions) throws Exception {
+        repairEngineNamespaceRoots(actions);
+        ArrayList<GhidraClass> classes = new ArrayList<>();
+        symbols.getClassNamespaces().forEachRemaining(classes::add);
+        ArrayList<DataType> types = new ArrayList<>();
+        dataTypeManager.getAllDataTypes().forEachRemaining(types::add);
+        ArrayList<List<String>> movedScopes = new ArrayList<>();
+        for (DataType type : types) {
+            monitor.checkCancelled();
+            String description = type.getDescription();
+            if (description == null || !(isGeneratedReflectedDatatype(type) ||
+                    description.startsWith("AZ SerializeContext reflected field type:"))) {
+                continue;
+            }
+            List<String> parts = cppScopeParts(type.getName());
+            DatatypeTarget canonical = null;
+            Matcher identity = UUID_RE.matcher(description);
+            if (identity.find()) {
+                String id = normalizeTypeId(identity.group());
+                ClassData body = typeEvidence == null ? null : typeEvidence.classBodiesByTypeId.get(id);
+                canonical = body == null ? null : datatypeTarget(body);
+                String qualified = datatypeNames.get(id);
+                if (canonical != null && !datatypeConflictingPaths.contains(datatypePathName(canonical))) {
+                    parts = new ArrayList<>(canonical.scope);
+                }
+                else if (canonical == null && qualified != null && balancedCppDelimiters(qualified) && !type.getName().contains("::")) {
+                    List<String> qualifiedParts = cppScopeParts(qualified);
+                    if (qualifiedParts.size() > 1) parts = qualifiedParts;
+                }
+            }
+            if (parts.size() < 2 && canonical == null) continue;
+            CategoryPath targetCategory = canonical == null ? datatypeCategoryPath(parts) : canonical.categoryPath;
+            String localName = canonical == null ? parts.get(parts.size() - 1) : canonical.name;
+            if (type.getCategoryPath().equals(targetCategory) && type.getName().equals(localName)) continue;
+            registerReflectedClassScope(parts);
+            JsonObject action = new JsonObject();
+            action.addProperty("kind", "datatype_name_migration");
+            action.addProperty("oldPath", type.getPathName());
+            action.addProperty("newCategory", targetCategory.getPath());
+            action.addProperty("newName", localName);
+            DataType collision = dataTypeManager.getDataType(targetCategory, localName);
+            if (collision != null && collision != type) {
+                if (type instanceof Structure && collision instanceof Structure &&
+                    ((Structure) type).getNumDefinedComponents() == 0 &&
+                    ((Structure) collision).getNumDefinedComponents() > 0 && type.getLength() == collision.getLength()) {
+                    // false: keep the existing layout at its canonical path; only references move.
+                    if (applyRenames) dataTypeManager.replaceDataType(type, collision, false);
+                    action.addProperty("applied", applyRenames);
+                    action.addProperty("wouldApply", !applyRenames);
+                    action.addProperty("reason", "empty-placeholder-references-redirected-to-existing-layout");
+                    actions.add(action);
+                    continue;
+                }
+                action.addProperty("applied", false);
+                action.addProperty("reason", "target-datatype-exists; preserved-both");
+                actions.add(action);
+                continue;
+            }
+            if (applyRenames) {
+                dataTypeManager.createCategory(targetCategory);
+                // Keep the managed type and its identity so pointers, fields and signatures stay attached.
+                type.setNameAndCategory(targetCategory, localName);
+                createScope(parts.subList(0, parts.size() - 1));
+                movedScopes.add(parts);
+            }
+            action.addProperty("applied", applyRenames);
+            action.addProperty("wouldApply", !applyRenames);
             actions.add(action);
+        }
+        for (GhidraClass klass : classes) {
+            monitor.checkCancelled();
+            List<String> parts = normalizeRepeatedScope(namespaceScope(klass));
+            if (balancedCppDelimiters(klass.getName(true))) rememberSplitTemplateScopes(parts);
+            boolean qualifiedScope = balancedCppDelimiters(klass.getName(true)) &&
+                namespaceScope(klass).stream().anyMatch(part -> cppScopeParts(part).size() > 1);
+            if (parts.size() < 2 || (!hasReflectedClassOwner(parts) && !hasSplitTemplateScope(klass) && !qualifiedScope)) {
+                continue;
+            }
+            if (namespaceScope(klass).equals(parts)) continue;
+            rememberTemplateScopeFragments(klass);
+            JsonObject action = new JsonObject();
+            action.addProperty("kind", "class_name_migration");
+            action.addProperty("oldPath", klass.getName(true));
+            action.addProperty("newPath", String.join("::", parts));
+            List<String> parentParts = parts.subList(0, parts.size() - 1);
+            Namespace parent = findScope(parentParts);
+            String localName = parts.get(parts.size() - 1);
+            Namespace collision = parent == null ? null : symbols.getNamespace(localName, parent);
+            if (collision != null && !collision.equals(klass)) {
+                if (collision instanceof GhidraClass && !symbols.getSymbols(klass).hasNext()) {
+                    action.addProperty("applied", applyRenames && klass.getSymbol().delete());
+                    action.addProperty("wouldApply", !applyRenames);
+                    action.addProperty("reason", "empty-flattened-class-duplicate");
+                    actions.add(action);
+                    continue;
+                }
+                action.addProperty("applied", false);
+                action.addProperty("reason", "target-class-exists; preserved-both");
+                actions.add(action);
+                continue;
+            }
+            if (applyRenames) {
+                parent = createScope(parentParts);
+                klass.getSymbol().setNameAndNamespace(localName, parent, SourceType.USER_DEFINED);
+                scopeCache.clear();
+            }
+            action.addProperty("applied", applyRenames);
+            action.addProperty("wouldApply", !applyRenames);
+            actions.add(action);
+        }
+        if (applyRenames) {
+            for (List<String> parts : movedScopes) createScope(parts);
+        }
+    }
+
+    private boolean hasReflectedClassOwner(List<String> scope) {
+        for (int i = 1; i <= scope.size(); i++) {
+            if (reflectedClassScopePaths.contains(String.join("::", scope.subList(0, i)))) return true;
+        }
+        return false;
+    }
+
+    private void repairEngineNamespaceRoots(ActionSink actions) throws Exception {
+        for (String name : new TreeSet<>(ENGINE_NAMESPACE_ROOTS)) {
+            Namespace root = symbols.getNamespace(name, currentProgram.getGlobalNamespace());
+            if (!(root instanceof GhidraClass)) continue;
+            monitor.checkCancelled();
+            JsonObject action = new JsonObject();
+            action.addProperty("kind", "namespace_kind_migration");
+            action.addProperty("name", name);
+            action.addProperty("oldSymbolId", root.getID());
+            if (applyRenames) {
+                Namespace replacement = convertClassRootToNamespace(root);
+                action.addProperty("newSymbolId", replacement.getID());
+                scopeCache.clear();
+            }
+            action.addProperty("applied", applyRenames);
+            action.addProperty("wouldApply", !applyRenames);
+            actions.add(action);
+        }
+    }
+
+    private Namespace convertClassRootToNamespace(Namespace root) throws Exception {
+        // Ghidra has no inverse of convertNamespaceToClass. Recreate only the root;
+        // reparent every immediate child in place, including functions and namespaces.
+        ArrayList<Symbol> children = new ArrayList<>();
+        symbols.getSymbols(root).forEachRemaining(children::add);
+        String name = root.getName();
+        String temporaryName = "__AzReflectionLegacy_" + name + "_" + root.getID();
+        while (symbols.getNamespace(temporaryName, root.getParentNamespace()) != null) {
+            temporaryName += "_";
+        }
+        int transaction = currentProgram.startTransaction("Repair namespace root " + name);
+        boolean commit = false;
+        try {
+            root.getSymbol().setName(temporaryName, SourceType.USER_DEFINED);
+            Namespace replacement = symbols.createNameSpace(root.getParentNamespace(), name, SourceType.USER_DEFINED);
+            for (Symbol child : children) {
+                monitor.checkCancelled();
+                child.setNamespace(replacement);
+            }
+            if (symbols.getSymbols(root).hasNext() || !root.getSymbol().delete()) {
+                throw new IllegalStateException("Could not retire empty class root " + temporaryName);
+            }
+            commit = true;
+            return replacement;
+        }
+        finally {
+            currentProgram.endTransaction(transaction, commit);
         }
     }
 
     private boolean isGeneratedReflectedDatatype(DataType dataType) {
         String description = dataType.getDescription();
-        return description != null &&
-            description.startsWith("AZ SerializeContext reflected type");
+        return isEmptyGhidraClassPlaceholder(dataType) || description != null &&
+            (description.startsWith("AZ SerializeContext reflected type") ||
+             description.startsWith("AZ SerializeContext reflected field type"));
+    }
+
+    private boolean isEmptyGhidraClassPlaceholder(DataType dataType) {
+        return dataType instanceof Structure && dataType.getLength() <= 1 &&
+            ((Structure) dataType).getNumDefinedComponents() == 0 &&
+            "PlaceHolder Class Structure".equals(dataType.getDescription());
     }
 
     private boolean sameStructure(Structure left, Structure right) {
@@ -7651,6 +9806,7 @@ public class AzReflectionRenamer extends GhidraScript {
         if (left.getLength() != right.getLength()) {
             return false;
         }
+        if (left.getAlignment() != right.getAlignment()) return false;
 
         DataTypeComponent[] leftComponents = left.getDefinedComponents();
         DataTypeComponent[] rightComponents = right.getDefinedComponents();
@@ -7751,47 +9907,421 @@ public class AzReflectionRenamer extends GhidraScript {
         return score;
     }
 
+    private boolean matchesNativeLayoutProfile() {
+        return supportsContainerPointerLayout() &&
+            matchesProfileBytes(0xd5ce20, "488b4218c3") &&
+            matchesProfileBytes(0xdb0880, "488b4a0848b88988888888888888482b0a48");
+    }
+
+    private boolean matchesProfileBytes(long rva, String hex) {
+        try {
+            byte[] bytes = new byte[hex.length() / 2];
+            if (currentProgram.getMemory().getBytes(currentProgram.getImageBase().add(rva), bytes) != bytes.length) return false;
+            for (int i = 0; i < bytes.length; i++) {
+                if ((bytes[i] & 255) != Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16)) return false;
+            }
+            return true;
+        }
+        catch (Exception error) { return false; }
+    }
+
+    private String nativeFamily(ClassData data) {
+        JsonObject generic = datatypeGenerics.get(normalizeTypeId(data.typeId));
+        JsonObject body = generic == null ? null : objectMember(generic, "classData");
+        return body == null ? data.targetTypeName : stringMember(body, "name");
+    }
+
+    private int nativeProfileSize(ClassData data) {
+        if (!nativeLayoutProfile) return 0;
+        String family = nativeFamily(data);
+        if (family == null) return 0;
+        if (datatypeGenerics.containsKey(normalizeTypeId(data.typeId)) &&
+            (data.targetTypeName == null || !(data.targetTypeName.equals(family) || data.targetTypeName.startsWith(family + "<")))) return 0;
+        int size = switch (family) {
+            case "AZStd::vector", "AZStd::list" -> 32;
+            case "AZStd::unordered_map", "AZStd::unordered_set" -> 144;
+            case "AZStd::string" -> 40;
+            case "AZStd::shared_ptr", "AZ::Uuid" -> 16;
+            case "AZ::Vector3", "AZ::Vector4", "AZ::Quaternion" -> 16;
+            case "AZStd::intrusive_ptr", "AZStd::unique_ptr", "AZ::EntityId" -> 8;
+            case "AZ::Crc32" -> 4;
+            case "AZ::Component" -> 24;
+            case "AZStd::pair" -> typeEvidence == null ? 0 : typeEvidence.nativeDataSizesByTypeId.getOrDefault(normalizeTypeId(data.typeId), 0);
+            default -> 0;
+        };
+        JsonObject generic = datatypeGenerics.get(normalizeTypeId(data.typeId));
+        if ("AZStd::array".equals(family) && generic != null) {
+            JsonObject member = genericMember(arrayMember(generic, "elements"), "element");
+            JsonObject arguments = objectMember(generic, "nonTypeTemplateArguments");
+            Integer count = arguments == null ? null : parseLayoutInteger(stringMember(arguments, "capacity"));
+            Integer stride = member == null ? null : parseLayoutInteger(stringMember(member, "dataSize"));
+            if (count != null && count > 0 && stride != null && stride > 0 && (long) count * stride <= 16 * 1024 * 1024) size = count * stride;
+        }
+        Integer observed = typeEvidence == null ? null : typeEvidence.nativeDataSizesByTypeId.get(normalizeTypeId(data.typeId));
+        return observed == null || observed == size ? size : 0;
+    }
+
+    private boolean processNativeDatatype(ClassData data, ActionSink actions) throws Exception {
+        int size = nativeProfileSize(data);
+        if (size <= 0) return false;
+        DatatypeTarget target = datatypeTarget(data);
+        if (target == null) return false;
+        JsonObject action = new JsonObject();
+        action.addProperty("kind", "datatype_native_layout");
+        action.addProperty("ownerTypeId", data.typeId);
+        action.addProperty("name", data.targetTypeName);
+        action.addProperty("layoutSize", size);
+        action.addProperty("evidence", "NewWorld 3-26 Size/EnumElements/ClearElements callbacks, sizeof from reflected by-value members; AzCore member names");
+        DataType existing = dataTypeManager.getDataType(target.categoryPath, target.name);
+        if (existing != null && !isGeneratedReflectedDatatype(existing)) {
+            action.addProperty("existingSize", existing.getLength());
+            action.addProperty("reason", existing.getLength() == size ? "existing-user-datatype" : "existing-user-size-mismatch; preserved");
+            action.addProperty("applied", false);
+            actions.add(action);
+            return true;
+        }
+        try {
+            Structure structure = new StructureDataType(target.categoryPath, target.name, size, dataTypeManager);
+            structure.setDescription(reflectedDatatypeDescription(data) + "; NewWorld 3-26 native ABI, verified callback offsets");
+            fillNativeLayout(data, structure);
+            String family = nativeFamily(data);
+            if (Set.of("AZ::Uuid", "AZ::Vector3", "AZ::Vector4", "AZ::Quaternion").contains(family)) {
+                structure.setExplicitMinimumAlignment(16);
+            }
+            else if ("AZ::Crc32".equals(family)) structure.setExplicitMinimumAlignment(4);
+            else if (!Set.of("AZStd::array", "AZStd::pair").contains(family)) structure.setExplicitMinimumAlignment(8);
+            applyCapturedAlignment(data, structure);
+            action.addProperty("fieldsWritten", structure.getNumDefinedComponents());
+            if (!applyRenames) {
+                action.addProperty("applied", false);
+                action.addProperty("wouldApply", true);
+                action.addProperty("reason", "dry-run");
+            }
+            else if (existing instanceof Structure && sameStructure((Structure) existing, structure)) {
+                action.addProperty("applied", false);
+                action.addProperty("reason", "already-current");
+            }
+            else {
+                saveGeneratedLayout(structure);
+                action.addProperty("applied", true);
+            }
+        }
+        catch (UnresolvedNativeLayoutException error) {
+            action.addProperty("applied", false);
+            action.addProperty("reason", "native-layout-unresolved");
+            action.addProperty("detail", error.getMessage());
+        }
+        catch (Exception error) {
+            action.addProperty("applied", false);
+            action.addProperty("reason", "native-layout-unresolved");
+            action.addProperty("error", error.getMessage());
+            action.addProperty("errorType", error.getClass().getName());
+        }
+        actions.add(action);
+        return true;
+    }
+
+    private void nativeField(Structure structure, int offset, DataType type, String name) {
+        structure.replaceAtOffset(offset, type, type.getLength(), name, "NewWorld 3-26 native ABI");
+    }
+
+    private static class UnresolvedNativeLayoutException extends IllegalArgumentException {
+        UnresolvedNativeLayoutException(String message) { super(message); }
+    }
+
+    private DataType saveGeneratedLayout(DataType candidate) {
+        DataType existing = dataTypeManager.getDataType(candidate.getCategoryPath(), candidate.getName());
+        if (existing != null && !isGeneratedReflectedDatatype(existing)) {
+            if (existing.getLength() != candidate.getLength()) throw new UnresolvedNativeLayoutException("manual helper size differs: " + existing.getPathName());
+            return existing;
+        }
+        if (!applyRenames) return candidate;
+        if (existing instanceof Structure && candidate instanceof Structure) {
+            if (!sameStructure((Structure) existing, (Structure) candidate)) ((Structure) existing).replaceWith(candidate);
+            existing.setDescription(candidate.getDescription());
+            return existing;
+        }
+        if (existing != null) return existing;
+        return dataTypeManager.addDataType(candidate, DataTypeConflictHandler.DEFAULT_HANDLER);
+    }
+
+    private Structure nativeHelper(CategoryPath path, String name, int size) {
+        Structure result = new StructureDataType(path, name, size, dataTypeManager);
+        result.setDescription("AZ SerializeContext reflected type: NewWorld 3-26 native ABI helper " + name);
+        return result;
+    }
+
+    private DataType nativeAllocator(boolean reference) {
+        Structure result = nativeHelper(new CategoryPath("/AZStd"), reference ? "allocator_ref" : "allocator", reference ? 16 : 8);
+        nativeField(result, 0, new PointerDataType(CharDataType.dataType, 8, dataTypeManager), "m_name");
+        if (reference) nativeField(result, 8, new PointerDataType(nativeAllocator(false), 8, dataTypeManager), "m_allocator");
+        return saveGeneratedLayout(result);
+    }
+
+    private ElementData genericLayoutElement(ClassData data, String memberName) {
+        JsonObject generic = datatypeGenerics.get(normalizeTypeId(data.typeId));
+        JsonObject member = generic == null ? null : genericMember(arrayMember(generic, "elements"), memberName);
+        if (member == null) throw new UnresolvedNativeLayoutException("missing generic member " + memberName);
+        ElementData element = new ElementData();
+        element.typeId = stringMember(member, "typeId");
+        element.typeName = datatypeNames.get(normalizeTypeId(element.typeId));
+        ClassData body = typeEvidence.classBodiesByTypeId.get(normalizeTypeId(element.typeId));
+        element.targetTypeName = body == null ? element.typeName : body.targetTypeName;
+        element.dataSize = stringMember(member, "dataSize");
+        element.isPointer = nativeElementIsPointer(member);
+        element.name = memberName;
+        element.safeName = memberName;
+        return element;
+    }
+
+    private DataType genericValueType(ClassData data) {
+        ElementData element = genericLayoutElement(data, "element");
+        Integer stride = parseLayoutInteger(element.dataSize);
+        if (stride == null || stride <= 0) throw new UnresolvedNativeLayoutException("unknown generic value stride");
+        return fieldDataType(data, element, stride);
+    }
+
+    private boolean nativeElementIsPointer(JsonObject element) {
+        Boolean pointer = boolMember(element, "is_pointer");
+        if (pointer != null) return pointer;
+        Integer flags = parseLayoutInteger(stringMember(element, "flags"));
+        return flags != null && (flags & 1) != 0;
+    }
+
+    private void nativeVector(Structure structure, DataType element, boolean referenceAllocator) {
+        DataType pointer = new PointerDataType(element, 8, dataTypeManager);
+        nativeField(structure, 0, pointer, "m_start");
+        nativeField(structure, 8, pointer, "m_last");
+        nativeField(structure, 16, pointer, "m_end");
+        nativeField(structure, 24, nativeAllocator(referenceAllocator), "m_allocator");
+    }
+
+    private void fillNativeLayout(ClassData data, Structure structure) throws Exception {
+        String family = nativeFamily(data);
+        DataType u64 = UnsignedLongLongDataType.dataType;
+        switch (family) {
+            case "AZ::Uuid":
+                nativeField(structure, 0, new ArrayDataType(ByteDataType.dataType, 16, 1), "data");
+                break;
+            case "AZ::Vector3":
+            case "AZ::Vector4":
+            case "AZ::Quaternion":
+                nativeField(structure, 0, new ArrayDataType(FloatDataType.dataType, 4, 4), "m_value");
+                structure.getComponentAt(0).setComment("Native SIMD storage; Vector3's fourth lane is not a reflected coordinate");
+                break;
+            case "AZ::EntityId": nativeField(structure, 0, u64, "m_id"); break;
+            case "AZ::Crc32": nativeField(structure, 0, UnsignedIntegerDataType.dataType, "m_value"); break;
+            case "AZ::Component":
+                nativeField(structure, 0, new PointerDataType(VoidDataType.dataType, 8, dataTypeManager), "vftable");
+                ElementData entity = new ElementData();
+                entity.typeId = "75651658-8663-478D-9090-2432DFCAFA44";
+                entity.typeName = "AZ::Entity";
+                nativeField(structure, 8, new PointerDataType(pointeeDataType(data, entity), 8, dataTypeManager), "m_entity");
+                nativeField(structure, 16, u64, "Id");
+                break;
+            case "AZStd::vector": nativeVector(structure, genericValueType(data), false); break;
+            case "AZStd::pair":
+                fillNativePair(data, structure);
+                break;
+            case "AZStd::array":
+                DataType value = genericValueType(data);
+                nativeField(structure, 0, new ArrayDataType(value, structure.getLength() / value.getLength(), value.getLength()), "m_elements");
+                break;
+            case "AZStd::shared_ptr":
+            case "AZStd::unique_ptr":
+            case "AZStd::intrusive_ptr":
+                nativeField(structure, 0, genericValueType(data), "AZStd::unique_ptr".equals(family) ? "pointer" : "px");
+                if ("AZStd::shared_ptr".equals(family)) nativeField(structure, 8, new PointerDataType(VoidDataType.dataType, 8, dataTypeManager), "pn");
+                break;
+            case "AZStd::string":
+                UnionDataType storage = new UnionDataType(new CategoryPath(structure.getCategoryPath(), structure.getName()), "storage", dataTypeManager);
+                storage.setDescription("AZ SerializeContext reflected type: NewWorld 3-26 string small-buffer storage");
+                storage.add(new ArrayDataType(CharDataType.dataType, 16, 1), "m_buffer", "capacity <= 15");
+                storage.add(new PointerDataType(CharDataType.dataType, 8, dataTypeManager), "m_data", "capacity > 15");
+                nativeField(structure, 0, saveGeneratedLayout(storage), "m_storage");
+                nativeField(structure, 16, u64, "m_size");
+                nativeField(structure, 24, u64, "m_capacity");
+                nativeField(structure, 32, nativeAllocator(false), "m_allocator");
+                break;
+            case "AZStd::list":
+            case "AZStd::unordered_map":
+            case "AZStd::unordered_set":
+                fillNativeHashOrList(data, structure, family);
+                break;
+            default: throw new IllegalArgumentException("native layout not implemented: " + family);
+        }
+    }
+
+    private void fillNativeHashOrList(ClassData data, Structure structure, String family) {
+        CategoryPath path = new CategoryPath(structure.getCategoryPath(), structure.getName());
+        DataType value = genericValueType(data);
+        int stride = parseLayoutInteger(genericLayoutElement(data, "element").dataSize);
+        Structure node = nativeHelper(path, "node", (16 + stride + 7) & ~7);
+        DataType nodePointer = new PointerDataType(node, 8, dataTypeManager);
+        nativeField(node, 0, nodePointer, "m_next");
+        nativeField(node, 8, nodePointer, "m_prev");
+        nativeField(node, 16, value, "m_value");
+        DataType savedNode = saveGeneratedLayout(node);
+        nodePointer = new PointerDataType(savedNode, 8, dataTypeManager);
+        Structure head = nativeHelper(path, "list_node_base", 16);
+        nativeField(head, 0, nodePointer, "m_next");
+        nativeField(head, 8, nodePointer, "m_prev");
+        DataType savedHead = saveGeneratedLayout(head);
+        if ("AZStd::list".equals(family)) {
+            nativeField(structure, 0, savedHead, "m_head");
+            nativeField(structure, 16, UnsignedLongLongDataType.dataType, "m_numElements");
+            nativeField(structure, 24, nativeAllocator(false), "m_allocator");
+            return;
+        }
+        Structure list = nativeHelper(path, "list_storage", 40);
+        nativeField(list, 0, savedHead, "m_head");
+        nativeField(list, 16, UnsignedLongLongDataType.dataType, "m_numElements");
+        nativeField(list, 24, nativeAllocator(true), "m_allocator");
+        Structure bucket = nativeHelper(path, "bucket", 16);
+        nativeField(bucket, 0, UnsignedLongLongDataType.dataType, "first");
+        nativeField(bucket, 8, nodePointer, "second");
+        DataType savedBucket = saveGeneratedLayout(bucket);
+        Structure vector = nativeHelper(path, "bucket_vector", 40);
+        nativeVector(vector, savedBucket, true);
+        nativeField(structure, 0, nativeAllocator(false), "m_allocator");
+        nativeField(structure, 8, saveGeneratedLayout(list), "m_list");
+        nativeField(structure, 0x30, saveGeneratedLayout(vector), "m_vector");
+        nativeField(structure, 0x60, new PointerDataType(savedBucket, 8, dataTypeManager), "m_buckets");
+        nativeField(structure, 0x68, UnsignedLongLongDataType.dataType, "m_numBuckets");
+        nativeField(structure, 0x70, FloatDataType.dataType, "m_max_load_factor");
+        nativeField(structure, 0x78, savedBucket, "m_startBucket");
+        // Predicate/hasher storage is not exposed by reflection. Leave its tail undefined.
+    }
+
+    private void fillNativePair(ClassData data, Structure structure) throws Exception {
+        JsonObject generic = datatypeGenerics.get(normalizeTypeId(data.typeId));
+        JsonObject body = objectMember(generic, "classData");
+        JsonObject info = objectMember(body, "containerInfo");
+        JsonArray slots = info == null ? null : arrayMember(info, "slots");
+        if (slots == null || slots.size() <= 3) throw new UnresolvedNativeLayoutException("missing pair EnumElements callback");
+        JsonObject slot = resolveObject(slots.get(3), jsonObjectsById);
+        Address callback = parseCaptureAddress(stringMember(slot, "address"));
+        Address table = parseCaptureAddress(stringMember(info, "vtable"));
+        if (callback == null || table == null || !callback.equals(readPointer(table.add(24)))) {
+            throw new UnresolvedNativeLayoutException("pair callback does not match loaded binary");
+        }
+        List<Integer> offsets = pairCallbackOffsets(callback);
+        if (offsets.size() != 2 || offsets.get(0) != 0) throw new UnresolvedNativeLayoutException("pair native offsets unresolved");
+        ElementData first = genericLayoutElement(data, "value1");
+        ElementData second = genericLayoutElement(data, "value2");
+        int firstSize = parseLayoutInteger(first.dataSize);
+        int secondSize = parseLayoutInteger(second.dataSize);
+        if (firstSize > offsets.get(1) || (long) offsets.get(1) + secondSize > structure.getLength()) {
+            throw new UnresolvedNativeLayoutException("pair native offsets exceed sizeof evidence");
+        }
+        nativeField(structure, 0, fieldDataType(data, first, firstSize), "first");
+        nativeField(structure, offsets.get(1), fieldDataType(data, second, secondSize), "second");
+    }
+
+    private List<Integer> pairCallbackOffsets(Address callback) {
+        Function function = currentProgram.getFunctionManager().getFunctionAt(callback);
+        if (function == null || function.getBody().getNumAddresses() > 4096) return List.of();
+        Register argument = currentProgram.getLanguage().getRegister("RDX");
+        if (argument == null) return List.of();
+        Map<Address, Long> tracked = new HashMap<>();
+        tracked.put(argument.getAddress(), 0L);
+        TreeSet<Integer> offsets = new TreeSet<>();
+        Iterator<Instruction> instructions = currentProgram.getListing().getInstructions(function.getBody(), true);
+        while (instructions.hasNext()) {
+            Instruction instruction = instructions.next();
+            // Unique temporaries are local to this instruction. Track only values derived
+            // from the native object's second ABI argument, never arbitrary constants.
+            tracked.keySet().removeIf(address -> address.getAddressSpace().isUniqueSpace());
+            for (PcodeOp op : instruction.getPcode()) {
+                if (op.getOpcode() == PcodeOp.CALL || op.getOpcode() == PcodeOp.CALLIND) {
+                    Long offset = tracked.get(argument.getAddress());
+                    if (offset != null && offset >= 0 && offset < 16 * 1024 * 1024) offsets.add(offset.intValue());
+                    for (String name : List.of("RAX", "RCX", "RDX", "R8", "R9", "R10", "R11")) {
+                        Register register = currentProgram.getLanguage().getRegister(name);
+                        if (register != null) tracked.remove(register.getAddress());
+                    }
+                }
+                Varnode output = op.getOutput();
+                if (output == null) continue;
+                Long value = null;
+                Varnode left = op.getNumInputs() > 0 ? op.getInput(0) : null;
+                Varnode right = op.getNumInputs() > 1 ? op.getInput(1) : null;
+                if (op.getOpcode() == PcodeOp.COPY || op.getOpcode() == PcodeOp.INT_ZEXT || op.getOpcode() == PcodeOp.INT_SEXT) {
+                    value = tracked.get(left.getAddress());
+                }
+                else if (op.getOpcode() == PcodeOp.INT_ADD || op.getOpcode() == PcodeOp.INT_SUB) {
+                    Long base = tracked.get(left.getAddress());
+                    if (base != null && right.isConstant()) {
+                        value = base + (op.getOpcode() == PcodeOp.INT_ADD ? right.getOffset() : -right.getOffset());
+                    }
+                    else if (op.getOpcode() == PcodeOp.INT_ADD && left.isConstant()) {
+                        base = tracked.get(right.getAddress());
+                        if (base != null) value = base + left.getOffset();
+                    }
+                }
+                if (value == null || output.getSize() != 8) tracked.remove(output.getAddress());
+                else tracked.put(output.getAddress(), value);
+            }
+        }
+        return new ArrayList<>(offsets);
+    }
+
     private Structure declareReflectedDatatype(ClassData data) throws Exception {
         DatatypeTarget target = datatypeTarget(data);
         if (target == null) {
             return null;
         }
+        if (enumUnderlyingTypes.containsKey(normalizeTypeId(data.typeId))) return null;
+        if (datatypeConflictingPaths.contains(datatypePathName(target))) return null;
         int layoutSize = reflectedLayoutSize(data);
-        if (layoutSize <= 0) {
+        if (layoutSize <= 0 && data.reflectionSource == null) {
             return null;
         }
 
         DataType existing = dataTypeManager.getDataType(target.categoryPath, target.name);
         if (existing instanceof Structure) {
             Structure existingStructure = (Structure) existing;
-            if (existingStructure.getLength() == layoutSize) {
+            if (!isGeneratedReflectedDatatype(existingStructure)) {
                 return existingStructure;
             }
-            if (!isGeneratedReflectedDatatype(existingStructure)) {
-                return null;
+            boolean placeholder = isEmptyGhidraClassPlaceholder(existingStructure);
+            // A zero-length StructureDB reports length 1 but grows from 0.
+            int currentLength = existingStructure.isZeroLength() ? 0 : existingStructure.getLength();
+            if (currentLength < layoutSize && applyRenames) {
+                existingStructure.growStructure(layoutSize - currentLength);
             }
-            Structure replacement =
-                new StructureDataType(target.categoryPath, target.name, layoutSize, dataTypeManager);
-            replacement.setDescription(reflectedDatatypeDescription(data));
-            if (!applyRenames) {
-                return replacement;
+            else if (currentLength < layoutSize) {
+                Structure result = new StructureDataType(target.categoryPath, target.name, layoutSize, dataTypeManager);
+                result.setDescription(reflectedDatatypeDescription(data));
+                applyCapturedAlignment(data, result);
+                return result;
             }
-            createScope(target.scope);
-            return (Structure) dataTypeManager.addDataType(
-                replacement,
-                DataTypeConflictHandler.REPLACE_HANDLER);
+            if (applyRenames) applyCapturedAlignment(data, existingStructure);
+            if (applyRenames && placeholder) existingStructure.setDescription(reflectedDatatypeDescription(data));
+            return existingStructure;
         }
         if (existing != null) {
             return null;
         }
 
-        createScope(target.scope);
         Structure structure =
             new StructureDataType(target.categoryPath, target.name, layoutSize, dataTypeManager);
         structure.setDescription(reflectedDatatypeDescription(data));
+        applyCapturedAlignment(data, structure);
+        if (!applyRenames) return structure;
+        createScope(target.scope);
         return (Structure) dataTypeManager.addDataType(
             structure,
             DataTypeConflictHandler.DEFAULT_HANDLER);
+    }
+
+    private void applyCapturedAlignment(ClassData data, Structure structure) {
+        if (behaviorContextEvidence == null) return;
+        BehaviorClassMetadata metadata = behaviorContextEvidence.classesByTypeId.get(normalizeTypeId(data.typeId));
+        Integer alignment = metadata == null ? null : metadata.alignment;
+        if (alignment != null && alignment > 0 && alignment <= 4096 && (alignment & (alignment - 1)) == 0) {
+            structure.setExplicitMinimumAlignment(alignment);
+        }
     }
 
     private void processReflectedDatatype(
@@ -7814,14 +10344,23 @@ public class AzReflectionRenamer extends GhidraScript {
             "name",
             fullName(target.scope.subList(0, target.scope.size() - 1), target.name));
         action.addProperty("datatypePath", target.categoryPath.getPath());
+        DataType existingType = dataTypeManager.getDataType(target.categoryPath, target.name);
+        if (existingType != null && !isGeneratedReflectedDatatype(existingType)) {
+            action.addProperty("applied", false);
+            action.addProperty("reason", "existing-user-datatype");
+            actions.add(action);
+            return;
+        }
 
         int layoutSize = reflectedLayoutSize(data);
         int fieldCount = reflectedLayoutFieldCount(data);
         action.addProperty("layoutSize", layoutSize);
         action.addProperty("fieldCount", fieldCount);
+        action.addProperty("layoutCoverage", typeEvidence.nativeDataSizesByTypeId.containsKey(normalizeTypeId(data.typeId)) ?
+            "native-size-known; unreflected-members-undefined" : "serialized-field-extent-only; native-size-may-be-larger");
         if (layoutSize <= 0 || fieldCount == 0) {
             action.addProperty("applied", false);
-            action.addProperty("reason", "missing-layout-fields");
+            action.addProperty("reason", layoutSize > 0 ? "opaque-native-layout; serialized-fields-unavailable" : "unknown-native-size");
             actions.add(action);
             return;
         }
@@ -7832,17 +10371,30 @@ public class AzReflectionRenamer extends GhidraScript {
 
         JsonArray fieldFailures = new JsonArray();
         int fieldsWritten = 0;
+        applyCapturedAlignment(data, structure);
         List<ElementData> sortedElements = sortedLayoutElements(data);
+        int previousEnd = 0;
+        Set<String> writtenMetadata = new HashSet<>();
+        int duplicateMetadataFields = 0;
         for (ElementData element : sortedElements) {
             Integer offset = parseLayoutInteger(element.offset);
             Integer dataSize = parseLayoutInteger(element.dataSize);
-            if (offset == null || dataSize == null || dataSize <= 0) {
+            if (!validLayoutRange(offset, dataSize)) {
                 addDatatypeFieldFailure(fieldFailures, element, "invalid-layout");
+                continue;
+            }
+            String identity = element.name + "|" + element.typeId + "|" + offset + "|" + dataSize + "|" + element.isPointer + "|" + element.isBaseClass;
+            if (!writtenMetadata.add(identity)) {
+                duplicateMetadataFields++;
                 continue;
             }
             try {
                 DataType fieldType = fieldDataType(data, element, dataSize);
                 int replaceLength = datatypeFieldReplaceLength(element, fieldType, dataSize);
+                if (offset < previousEnd) {
+                    addDatatypeFieldFailure(fieldFailures, element, "overlapping-native-fields");
+                    continue;
+                }
                 structure.replaceAtOffset(
                     offset,
                     fieldType,
@@ -7850,6 +10402,7 @@ public class AzReflectionRenamer extends GhidraScript {
                     datatypeFieldName(element),
                     datatypeFieldComment(element));
                 fieldsWritten++;
+                previousEnd = offset + replaceLength;
             }
             catch (Exception error) {
                 JsonObject failure = datatypeFieldFailure(element, "field-apply-failed");
@@ -7858,6 +10411,7 @@ public class AzReflectionRenamer extends GhidraScript {
             }
         }
         action.addProperty("fieldsWritten", fieldsWritten);
+        action.addProperty("duplicateMetadataFields", duplicateMetadataFields);
         action.addProperty("fieldFailures", fieldFailures.size());
         if (fieldFailures.size() > 0) {
             action.add("fieldFailureSamples", fieldFailures);
@@ -7878,7 +10432,11 @@ public class AzReflectionRenamer extends GhidraScript {
                     action.addProperty("reason", "already-current");
                 }
                 else {
-                    dataTypeManager.addDataType(structure, DataTypeConflictHandler.REPLACE_HANDLER);
+                    if (existing instanceof Structure) {
+                        ((Structure) existing).replaceWith(structure);
+                        existing.setDescription(structure.getDescription());
+                    }
+                    else dataTypeManager.addDataType(structure, DataTypeConflictHandler.DEFAULT_HANDLER);
                     applied = true;
                 }
             }
@@ -8052,58 +10610,30 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         action.addProperty("function", function.getName(true));
 
-        if (reflectedLayoutSize(target.owner) <= 0 ||
-            reflectedLayoutFieldCount(target.owner) == 0) {
-            action.addProperty("applied", false);
-            action.addProperty("reason", "datatype-missing-layout");
-            actions.add(action);
-            return;
-        }
-
-        if (!applyRenames) {
-            action.addProperty("applied", false);
-            action.addProperty("wouldApply", true);
-            action.addProperty("reason", "dry-run");
-            actions.add(action);
-            return;
-        }
-
         Structure structure = reflectedStructure(target.owner);
         if (structure == null) {
             structure = declaredStructures.get(target.ownerTypeId);
         }
         if (structure == null) {
             action.addProperty("applied", false);
-            action.addProperty("reason", "datatype-missing");
+            action.addProperty("reason", reflectedLayoutSize(target.owner) <= 0
+                ? "datatype-missing-layout"
+                : "datatype-missing");
+            actions.add(action);
+            return;
+        }
+        // Opaque sized owners (BehaviorContext size, no serialized fields) still name the receiver.
+        if (structure.isZeroLength() || isEmptyGhidraClassPlaceholder(structure)) {
+            action.addProperty("applied", false);
+            action.addProperty("reason", "datatype-missing-layout");
             actions.add(action);
             return;
         }
 
-        boolean applied = false;
         try {
-            Parameter[] parameters = function.getParameters();
             DataType thisPointer = new PointerDataType(structure, dataTypeManager);
-            if (parameters.length > 0 &&
-                "this".equals(parameters[0].getName()) &&
-                sameDataType(parameters[0].getDataType(), thisPointer)) {
-                action.addProperty("reason", "already-current");
-                action.addProperty("applied", false);
-                actions.add(action);
-                return;
-            }
-            Parameter[] updated = parameters.length == 0
-                ? new Parameter[1]
-                : parameters.clone();
-            updated[0] = new ParameterImpl(
-                "this",
-                thisPointer,
-                currentProgram);
-            function.replaceParameters(
-                FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
-                true,
-                SourceType.USER_DEFINED,
-                updated);
-            applied = true;
+            updateReflectionSignature(function, new String[] { "this" },
+                new DataType[] { thisPointer }, null, action);
         }
         catch (Exception error) {
             action.addProperty("applied", false);
@@ -8112,7 +10642,6 @@ public class AzReflectionRenamer extends GhidraScript {
             actions.add(action);
             return;
         }
-        action.addProperty("applied", applied);
         actions.add(action);
     }
 
@@ -8169,6 +10698,11 @@ public class AzReflectionRenamer extends GhidraScript {
         target.scope = scope;
         target.name = name;
         target.categoryPath = datatypeCategoryPath(scope);
+        target.canonicalPathName = datatypePathName(target);
+        String identity = normalizeTypeId(typeId);
+        if (identity != null && datatypeConflictingPaths.contains(target.canonicalPathName)) {
+            target.categoryPath = new CategoryPath(new CategoryPath(target.categoryPath, "__typeid__"), identity);
+        }
         return target;
     }
 
@@ -8190,15 +10724,12 @@ public class AzReflectionRenamer extends GhidraScript {
         if (typeEvidence != null) {
             data = typeEvidence.classBodiesByTypeId.get(normalizeTypeId(typeId));
         }
-        if (data != null && shouldUseDatatypeOwnerScope(data)) {
+        List<String> parts = cppScopeParts(data != null ? data.targetTypeName : typeName);
+        if (parts.size() == 1 && data != null && shouldUseDatatypeOwnerScope(data)) {
             result.addAll(data.ownerScope);
         }
-        String targetTypeName = data != null
-            ? safeTypeName(data.targetTypeName)
-            : safeTypeName(typeName);
-        if (targetTypeName != null) {
-            result.add(targetTypeName);
-        }
+        result.addAll(parts);
+        registerReflectedClassScope(result);
         return result;
     }
 
@@ -8223,7 +10754,7 @@ public class AzReflectionRenamer extends GhidraScript {
         for (ElementData element : data.elements) {
             Integer offset = parseLayoutInteger(element.offset);
             Integer dataSize = parseLayoutInteger(element.dataSize);
-            if (offset == null || dataSize == null || dataSize <= 0) {
+            if (!validLayoutRange(offset, dataSize)) {
                 continue;
             }
             result = Math.max(result, offset + dataSize);
@@ -8235,7 +10766,14 @@ public class AzReflectionRenamer extends GhidraScript {
                 result = Math.max(result, nativeDataSize);
             }
         }
+        int profileSize = nativeProfileSize(data);
+        if (profileSize > 0) result = Math.max(result, profileSize);
         return result;
+    }
+
+    private boolean validLayoutRange(Integer offset, Integer size) {
+        return offset != null && size != null && offset >= 0 && size > 0 &&
+            (long) offset + size <= 16 * 1024 * 1024;
     }
 
     private int reflectedLayoutFieldCount(ClassData data) {
@@ -8243,7 +10781,7 @@ public class AzReflectionRenamer extends GhidraScript {
         for (ElementData element : data.elements) {
             Integer offset = parseLayoutInteger(element.offset);
             Integer dataSize = parseLayoutInteger(element.dataSize);
-            if (offset != null && dataSize != null && dataSize > 0) {
+            if (validLayoutRange(offset, dataSize)) {
                 result++;
             }
         }
@@ -8290,19 +10828,99 @@ public class AzReflectionRenamer extends GhidraScript {
         ElementData element,
         int dataSize) {
 
-        DataType nested = nestedFieldDataType(owner, element, dataSize);
-        if (nested != null) {
-            return nested;
+        if (element.isPointer) {
+            if (dataSize != currentProgram.getDefaultPointerSize()) {
+                throw new IllegalArgumentException("pointer-size-mismatch");
+            }
+            return new PointerDataType(pointeeDataType(owner, element), dataSize, dataTypeManager);
+        }
+        DataType enumType = enumFieldDataType(element, dataSize);
+        if (enumType != null) return enumType;
+        if (isReflectedValueWrapper(element)) {
+            DataType wrapper = nestedFieldDataType(owner, element, dataSize);
+            if (wrapper != null) return wrapper;
         }
         DataType scalar = scalarFieldDataType(element, dataSize);
         if (scalar != null) {
             return scalar;
         }
+        DataType nested = nestedFieldDataType(owner, element, dataSize);
+        if (nested != null) return nested;
         DataType named = namedFieldDataType(owner, element, dataSize);
         if (named != null) {
             return named;
         }
         return new ArrayDataType(new Undefined1DataType(), dataSize, 1);
+    }
+
+    private DataType pointeeDataType(ClassData owner, ElementData element) {
+        String id = normalizeTypeId(element.typeId);
+        ClassData body = typeEvidence == null ? null : typeEvidence.classBodiesByTypeId.get(id);
+        DatatypeTarget bodyTarget = body == null ? null : datatypeTarget(body);
+        if (bodyTarget != null && datatypeConflictingPaths.contains(datatypePathName(bodyTarget))) return VoidDataType.dataType;
+        ElementData pointee = new ElementData();
+        pointee.typeId = element.typeId;
+        String name = body != null ? body.targetTypeName : datatypeNames.get(id);
+        if (name == null) {
+            name = element.typeName;
+            if (name != null && element.isPointer && name.trim().endsWith("*")) {
+                name = name.trim().substring(0, name.trim().length() - 1).trim();
+            }
+        }
+        pointee.typeName = name;
+        pointee.targetTypeName = safeTypeName(name);
+        for (int size : new int[]{1, 2, 4, 8}) {
+            if (enumUnderlyingTypes.containsKey(id)) {
+                DataType enumType = enumFieldDataType(pointee, size);
+                if (enumType != null) return enumType;
+            }
+            if (isReflectedValueWrapper(pointee)) break;
+            DataType scalar = scalarFieldDataType(pointee, size);
+            if (scalar != null) return scalar;
+        }
+        Structure declared = declaredStructuresByTypeId.get(id);
+        if (declared != null) return declared;
+        if (body != null) {
+            Structure existing = reflectedStructure(body);
+            if (existing != null) return existing;
+        }
+        if (name == null) return VoidDataType.dataType;
+        DatatypeTarget target = datatypeTarget(id, name);
+        if (target == null) return VoidDataType.dataType;
+        if (datatypeConflictingPaths.contains(datatypePathName(target))) return VoidDataType.dataType;
+        DataType existing = dataTypeManager.getDataType(target.categoryPath, target.name);
+        if (existing != null) return existing;
+        Integer nativeSize = typeEvidence == null ? null : typeEvidence.nativeDataSizesByTypeId.get(id);
+        int size = nativeSize != null ? nativeSize : body != null ? reflectedLayoutSize(body) : 0;
+        Structure result = new StructureDataType(target.categoryPath, target.name, size, dataTypeManager);
+        result.setDescription("AZ SerializeContext reflected field type: " + name + " (" + id + "); " +
+            (size > 0 ? "native size from by-value evidence" : "incomplete pointee; native size unknown"));
+        return saveGeneratedLayout(result);
+    }
+
+    private boolean isReflectedValueWrapper(ElementData element) {
+        String id = normalizeTypeId(element.typeId);
+        return "6383F1D3-BB27-4E6B-A49A-6409B2059EAA".equals(id) ||
+            "9F4E062E-06A0-46D4-85DF-E0DA96467D3A".equals(id);
+    }
+
+    private DataType enumFieldDataType(ElementData element, int size) {
+        String underlyingId = enumUnderlyingTypes.get(normalizeTypeId(element.typeId));
+        if (underlyingId == null) return null;
+        ElementData underlying = new ElementData();
+        underlying.typeId = underlyingId;
+        DataType scalar = scalarFieldDataType(underlying, size);
+        if (scalar == null) return null;
+        String name = element.targetTypeName != null ? element.targetTypeName : element.typeName;
+        if (name == null) name = datatypeNames.get(normalizeTypeId(element.typeId));
+        DatatypeTarget target = datatypeTarget(element.typeId, name);
+        if (target == null) return scalar;
+        DataType existing = dataTypeManager.getDataType(target.categoryPath, target.name);
+        if (existing != null && !isGeneratedReflectedDatatype(existing)) return existing;
+        TypedefDataType result = new TypedefDataType(target.categoryPath, target.name, scalar, dataTypeManager);
+        if (!applyRenames) return result;
+        if (existing != null && !(existing instanceof Structure)) return existing;
+        return dataTypeManager.addDataType(result, DataTypeConflictHandler.REPLACE_HANDLER);
     }
 
     private DataType nestedFieldDataType(
@@ -8325,6 +10943,8 @@ public class AzReflectionRenamer extends GhidraScript {
         if (fieldClassData == null) {
             return null;
         }
+        DatatypeTarget target = datatypeTarget(fieldClassData);
+        if (target != null && datatypeConflictingPaths.contains(datatypePathName(target))) return null;
         structure = reflectedStructure(fieldClassData);
         if (structure == null || !fieldTypeFitsLayoutSlot(element, structure, dataSize)) {
             return null;
@@ -8438,6 +11058,7 @@ public class AzReflectionRenamer extends GhidraScript {
         if (target == null) {
             return null;
         }
+        if (datatypeConflictingPaths.contains(datatypePathName(target))) return null;
 
         DataType existing = dataTypeManager.getDataType(target.categoryPath, target.name);
         if (existing != null) {
@@ -8512,6 +11133,9 @@ public class AzReflectionRenamer extends GhidraScript {
             }
             comment.append("base class");
         }
+        if (element.isPointer) comment.append("; native pointer");
+        String underlying = enumUnderlyingTypes.get(normalizeTypeId(element.typeId));
+        if (underlying != null) comment.append("; enum underlying typeId: ").append(underlying);
         return comment.length() == 0 ? null : comment.toString();
     }
 
@@ -8524,6 +11148,7 @@ public class AzReflectionRenamer extends GhidraScript {
         if (data.typeId != null) {
             description.append(" (").append(data.typeId).append(")");
         }
+        if (data.reflectionSource != null) description.append("; identity from ").append(data.reflectionSource);
         return description.toString();
     }
 
@@ -8838,15 +11463,16 @@ public class AzReflectionRenamer extends GhidraScript {
         if (typeEvidence != null) {
             data = typeEvidence.classBodiesByTypeId.get(normalizeTypeId(typeId));
         }
-        if (data != null && hasOwner(data.ownerScope)) {
+        List<String> parts = cppScopeParts(data != null ? data.targetTypeName : typeName);
+        if (parts.size() == 1 && data != null && hasOwner(data.ownerScope)) {
             result.addAll(data.ownerScope);
+            if (ownerScopeNamesType(data.ownerScope, data.targetTypeName)) {
+                registerReflectedClassScope(result);
+                return result;
+            }
         }
-        String targetTypeName = data != null
-            ? safeTypeName(data.targetTypeName)
-            : safeTypeName(typeName);
-        if (targetTypeName != null) {
-            result.add(targetTypeName);
-        }
+        result.addAll(parts);
+        registerReflectedClassScope(result);
         return result;
     }
 
@@ -8889,12 +11515,10 @@ public class AzReflectionRenamer extends GhidraScript {
             actions.add(action);
             return;
         }
-        if (!reserveTargetName(targetName, address, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, address, action);
 
         if (actions.keepsFullActions()) {
-            action.add("oldNames", oldNames(callsite));
+            actions.captureOldNames(callsite, action);
         }
         boolean applied = false;
         if (applyRenames) {
@@ -9072,12 +11696,10 @@ public class AzReflectionRenamer extends GhidraScript {
             "field_registration_helper_function",
             functionSeen,
             actions);
-        if (!reserveTargetName(targetName, address, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, address, action);
 
         if (actions.keepsFullActions()) {
-            action.add("oldNames", oldNames(callsite));
+            actions.captureOldNames(callsite, action);
         }
         boolean applied = false;
         if (applyRenames) {
@@ -9262,13 +11884,11 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         functionSeen.add(functionKey);
 
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
 
         action.addProperty("oldName", function.getName(true));
         boolean applied = false;
-        if (applyRenames && !function.getName(true).equals(targetName)) {
+        if (applyRenames && !functionHasTargetName(function, scope, localName)) {
             applied = applyFunctionRename(function, scope, localName, action);
             if (!applied && action.has("reason")) {
                 action.addProperty("applied", false);
@@ -9277,7 +11897,7 @@ public class AzReflectionRenamer extends GhidraScript {
             }
         }
         action.addProperty("applied", applied);
-        if (!applyRenames && !function.getName(true).equals(targetName)) {
+        if (!applyRenames && !functionHasTargetName(function, scope, localName)) {
             action.addProperty("wouldApply", true);
             action.addProperty("reason", "dry-run");
         }
@@ -9342,9 +11962,7 @@ public class AzReflectionRenamer extends GhidraScript {
             actions.add(action);
             return;
         }
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
 
         Function function = currentProgram.getFunctionManager().getFunctionAt(address);
         boolean created = false;
@@ -9363,11 +11981,11 @@ public class AzReflectionRenamer extends GhidraScript {
         action.addProperty("oldName", function.getName(true));
         action.addProperty("created", created);
         boolean applied = false;
-        if (applyRenames && !function.getName(true).equals(targetName)) {
+        if (applyRenames && !functionHasTargetName(function, scope, localName)) {
             applied = applyFunctionRename(function, scope, localName, action);
         }
         action.addProperty("applied", applied);
-        if (!applyRenames && !function.getName(true).equals(targetName)) {
+        if (!applyRenames && !functionHasTargetName(function, scope, localName)) {
             action.addProperty("wouldApply", true);
             action.addProperty("reason", "dry-run");
         }
@@ -9396,11 +12014,11 @@ public class AzReflectionRenamer extends GhidraScript {
         String localName,
         JsonObject action) throws Exception {
 
-        String targetName = fullName(scope, localName);
-        if (function.getName(true).equals(targetName)) {
+        if (functionHasTargetName(function, scope, localName)) {
             return false;
         }
 
+        rememberTemplateScopeFragments(function.getParentNamespace());
         Namespace namespace = createScope(scope);
         Symbol blocker = symbols.getSymbol(localName, function.getEntryPoint(), namespace);
         if (blocker != null) {
@@ -9417,9 +12035,95 @@ public class AzReflectionRenamer extends GhidraScript {
             action.addProperty("removedBlockingSymbol", true);
         }
 
-        function.setName(localName, SourceType.USER_DEFINED);
-        function.setParentNamespace(namespace);
+        function.getSymbol().setNameAndNamespace(localName, namespace, SourceType.USER_DEFINED);
         return true;
+    }
+
+    private boolean functionHasTargetName(Function function, List<String> scope, String localName) {
+        return function.getName().equals(localName) && namespaceScope(function.getParentNamespace()).equals(scope);
+    }
+
+    private boolean hasSplitTemplateScope(Namespace namespace) {
+        if (!balancedCppDelimiters(namespace.getName(true))) return false;
+        for (String part : namespaceScope(namespace)) if (!balancedCppDelimiters(part)) return true;
+        return false;
+    }
+
+    private void rememberTemplateScopeFragments(Namespace namespace) {
+        while (namespace != null && !namespace.isGlobal()) {
+            if (!balancedCppDelimiters(namespace.getName()) || !balancedCppDelimiters(namespace.getName(true))) {
+                templateScopeCandidates.add(namespace);
+            }
+            namespace = namespace.getParentNamespace();
+        }
+    }
+
+    private void rememberSplitTemplateScopes(List<String> scope) {
+        // Probe the legacy literal split for empty leftovers; never create scopes with it.
+        Namespace parent = currentProgram.getGlobalNamespace();
+        for (String part : String.join("::", scope).split("::")) {
+            parent = symbols.getNamespace(part, parent);
+            if (parent == null) return;
+            if (!balancedCppDelimiters(part) || !balancedCppDelimiters(parent.getName(true))) templateScopeCandidates.add(parent);
+        }
+    }
+
+    private void cleanupTemplateLabelNamespaces(ActionSink actions) throws Exception {
+        for (Namespace owner : new ArrayList<>(templateScopeCandidates)) {
+            monitor.checkCancelled();
+            if (symbols.getSymbol(owner.getID()) == null) continue;
+            List<String> oldScope = namespaceScope(owner);
+            List<String> scope = normalizeRepeatedScope(oldScope);
+            if (scope.equals(oldScope)) continue;
+            ArrayList<Symbol> labels = new ArrayList<>();
+            symbols.getSymbols(owner).forEachRemaining(symbol -> {
+                if (symbol.getSymbolType().equals(SymbolType.LABEL)) labels.add(symbol);
+            });
+            for (Symbol label : labels) {
+                monitor.checkCancelled();
+                JsonObject action = new JsonObject();
+                action.addProperty("kind", "template_label_namespace_cleanup");
+                action.addProperty("symbolId", label.getID());
+                action.addProperty("address", formatAddress(label.getAddress()));
+                action.addProperty("name", fullName(scope, label.getName()));
+                action.add("oldScope", listStringArray(oldScope));
+                action.add("scope", listStringArray(scope));
+                if (applyRenames) {
+                    Namespace target = createScope(scope);
+                    Symbol existing = symbols.getSymbol(label.getName(), label.getAddress(), target);
+                    if (existing != null) {
+                        if (label.isPrimary() && !existing.isPrimary()) existing.setPrimary();
+                        if (!label.delete()) throw new IllegalStateException("Cannot merge template label: " + label.getName(true));
+                        action.addProperty("mergedIntoSymbolId", existing.getID());
+                    }
+                    else label.setNamespace(target);
+                }
+                action.addProperty("applied", applyRenames);
+                action.addProperty("wouldApply", !applyRenames);
+                actions.add(action);
+            }
+        }
+    }
+
+    private void pruneEmptyTemplateScopeFragments(ActionSink actions) throws Exception {
+        ArrayList<Namespace> candidates = new ArrayList<>(templateScopeCandidates);
+        candidates.sort((left, right) -> Integer.compare(namespaceScope(right).size(), namespaceScope(left).size()));
+        for (Namespace namespace : candidates) {
+            monitor.checkCancelled();
+            Symbol symbol = symbols.getSymbol(namespace.getID());
+            if (symbol == null || (balancedCppDelimiters(symbol.getName()) && balancedCppDelimiters(namespace.getName(true))) ||
+                (!balancedCppDelimiters(namespace.getName(true)) && reflectedClassScopePaths.contains(namespace.getName(true))) ||
+                symbols.getSymbols(namespace).hasNext()) continue;
+            JsonObject action = new JsonObject();
+            action.addProperty("kind", "empty_template_namespace_cleanup");
+            action.addProperty("name", namespace.getName(true));
+            action.addProperty("symbolId", namespace.getID());
+            if (applyRenames && !symbol.delete()) throw new IllegalStateException("Cannot remove empty template fragment: " + symbol.getName(true));
+            action.addProperty("applied", applyRenames);
+            action.addProperty("wouldApply", !applyRenames);
+            actions.add(action);
+        }
+        if (applyRenames) scopeCache.clear();
     }
 
     private boolean ensureLabel(
@@ -9551,12 +12255,10 @@ public class AzReflectionRenamer extends GhidraScript {
             actions.add(action);
             return;
         }
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
 
         if (actions.keepsFullActions()) {
-            action.add("oldNames", oldNames(address));
+            actions.captureOldNames(address, action);
         }
         boolean applied = false;
         if (applyRenames) {
@@ -9616,12 +12318,10 @@ public class AzReflectionRenamer extends GhidraScript {
             actions.add(action);
             return;
         }
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
+        recordTargetNameAddress(targetName, jsonAddress, action);
 
         if (actions.keepsFullActions()) {
-            action.add("oldNames", oldNames(address));
+            actions.captureOldNames(address, action);
         }
         boolean applied = false;
         if (applyRenames) {
@@ -9635,27 +12335,19 @@ public class AzReflectionRenamer extends GhidraScript {
         actions.add(action);
     }
 
-    private boolean reserveTargetName(
+    private void recordTargetNameAddress(
         String targetName,
         String jsonAddress,
-        JsonObject action,
-        ActionSink actions) {
+        JsonObject action) {
 
         String targetAddress = addressKey(jsonAddress);
         String existingAddress = targetNameOwners.get(targetName);
         if (existingAddress == null) {
             targetNameOwners.put(targetName, targetAddress);
-            return true;
         }
-        if (existingAddress.equals(targetAddress)) {
-            return true;
+        else if (!existingAddress.equals(targetAddress)) {
+            action.addProperty("sameQualifiedNameAtOtherAddress", existingAddress);
         }
-
-        action.addProperty("applied", false);
-        action.addProperty("reason", "duplicate-target-name");
-        action.addProperty("existingAddress", existingAddress);
-        actions.add(action);
-        return false;
     }
 
     private void addSkipped(
@@ -9748,9 +12440,15 @@ public class AzReflectionRenamer extends GhidraScript {
     private boolean isClassScope(List<String> scope, int index) {
         String part = scope.get(index);
         int azIndex = scope.indexOf("AZ");
+        if (index == 0 && ENGINE_NAMESPACE_ROOTS.contains(part)) {
+            return false;
+        }
         if (isBehaviorEventScope(part)) {
             return false;
         }
+        String path = String.join("::", scope.subList(0, index + 1));
+        if (reflectedClassScopePaths.contains(path)) return true;
+        if (reflectedNamespaceScopePaths.contains(path)) return false;
         return (index == 0 && isModuleClassName(part)) ||
             (index + 1 < scope.size() && isBehaviorEventScope(scope.get(index + 1))) ||
             (azIndex > 0 && index == azIndex - 1) ||
@@ -9800,6 +12498,7 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         Matcher moduleMatch = MODULE_ADDR_RE.matcher(value);
         if (moduleMatch.matches()) {
+            if (!isNewWorldCaptureModule(moduleMatch.group("module"))) return null;
             long offset = Long.parseUnsignedLong(moduleMatch.group("offset"), 16);
             return currentProgram.getImageBase().add(offset);
         }
@@ -9811,6 +12510,10 @@ public class AzReflectionRenamer extends GhidraScript {
                 .getAddress(address);
         }
         return null;
+    }
+
+    private static boolean isNewWorldCaptureModule(String module) {
+        return "NewWorld".equalsIgnoreCase(module) || "NewWorld.exe".equalsIgnoreCase(module);
     }
 
     private Address readPointer(Address address) {
@@ -9919,6 +12622,7 @@ public class AzReflectionRenamer extends GhidraScript {
     private String captureOffset(String value) {
         Matcher moduleMatch = MODULE_ADDR_RE.matcher(value);
         if (moduleMatch.matches()) {
+            if (!isNewWorldCaptureModule(moduleMatch.group("module"))) return null;
             return moduleMatch.group("offset").toLowerCase(Locale.ROOT);
         }
         Matcher hexMatch = HEX_ADDR_RE.matcher(value);
@@ -10282,7 +12986,7 @@ public class AzReflectionRenamer extends GhidraScript {
             element.offset = stringMember(elementObject, "offset");
             element.dataSize = stringMember(elementObject, "dataSize");
             element.isBaseClass = Boolean.TRUE.equals(boolMember(elementObject, "is_base_class"));
-            element.isPointer = Boolean.TRUE.equals(boolMember(elementObject, "is_pointer"));
+            element.isPointer = nativeElementIsPointer(elementObject);
             element.genericTypeIds = genericTypeIds(elementObject);
             element.callbacks = elementCallbacksFrom(elementObject);
             result.add(element);
@@ -10491,12 +13195,30 @@ public class AzReflectionRenamer extends GhidraScript {
         }
 
         String format() {
-            return archiveEntryName == null ? "json" : "7z";
+            return archiveEntryName == null ? "json" : file.getName().toLowerCase(Locale.ROOT).endsWith(".zip") ? "zip" : "7z";
         }
 
         Reader openReader() throws Exception {
             if (archiveEntryName == null) {
                 return new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8);
+            }
+            if (format().equals("zip")) {
+                ZipFile archive = new ZipFile(file);
+                try {
+                    ZipEntry entry = archive.getEntry(archiveEntryName);
+                    if (entry == null) throw new IOException("archive entry not found: " + archiveEntryName);
+                    return new InputStreamReader(new java.io.FilterInputStream(archive.getInputStream(entry)) {
+                        @Override
+                        public void close() throws IOException {
+                            try { super.close(); }
+                            finally { archive.close(); }
+                        }
+                    }, StandardCharsets.UTF_8);
+                }
+                catch (Exception error) {
+                    archive.close();
+                    throw error;
+                }
             }
 
             SevenZFile archive = new SevenZFile(file);
@@ -10568,7 +13290,14 @@ public class AzReflectionRenamer extends GhidraScript {
         }
     }
 
-    private static class BehaviorContextEvidence {
+    private static class BehaviorClassMetadata {
+        String typeId;
+        String name;
+        Integer size;
+        Integer alignment;
+    }
+
+    private class BehaviorContextEvidence {
         String input;
         String inputFormat;
         String archiveEntry;
@@ -10596,6 +13325,19 @@ public class AzReflectionRenamer extends GhidraScript {
         int safeDirectFunctionCount;
         int sharedFunctionGroupCount;
         int virtualDispatchGroupCount;
+        final Set<String> seenClasses = new HashSet<>();
+        final JsonArraySpool classInventory = new JsonArraySpool(true, !dryRun);
+        final JsonArraySpool globalMethodInventory = new JsonArraySpool(true, !dryRun);
+        final JsonArraySpool globalPropertyInventory = new JsonArraySpool(true, !dryRun);
+        final JsonArraySpool ebusInventory = new JsonArraySpool(true, !dryRun);
+        final JsonArray typeToClassInventory = new JsonArray();
+        final JsonArray onDemandInventory = new JsonArray();
+        final JsonArray constantInventory = new JsonArray();
+        final JsonObject contextMetadata = new JsonObject();
+        final Map<String, Integer> unresolvedCounts = new LinkedHashMap<>();
+        final Map<String, Integer> attributeCounts = new LinkedHashMap<>();
+        final ArrayList<BehaviorConstantProperty> globalProperties = new ArrayList<>();
+        final Map<String, JsonObject> classFactsByTypeId = new LinkedHashMap<>();
         final ArrayList<BehaviorFunctionCandidate> functionCandidates = new ArrayList<>();
         final LinkedHashMap<String, BehaviorFunctionGroup> groupsByAddress =
             new LinkedHashMap<>();
@@ -10604,17 +13346,29 @@ public class AzReflectionRenamer extends GhidraScript {
         final LinkedHashMap<String, Integer> classNameCounts = new LinkedHashMap<>();
         final LinkedHashMap<String, Integer> busNameCounts = new LinkedHashMap<>();
         final LinkedHashSet<String> classTypeIds = new LinkedHashSet<>();
+        final LinkedHashMap<String, String> typeNamesByTypeId = new LinkedHashMap<>();
+        final LinkedHashMap<String, BehaviorClassMetadata> classesByTypeId = new LinkedHashMap<>();
+        final LinkedHashSet<String> layoutConflicts = new LinkedHashSet<>();
         final LinkedHashSet<String> duplicateBusNames = new LinkedHashSet<>();
         final ArrayList<String> skippedReasons = new ArrayList<>();
     }
 
+    private static class BehaviorConstantProperty {
+        String name;
+        String getter;
+        boolean writable;
+    }
+
     private static class BehaviorFunctionCandidate {
         String address;
+        String ownerTypeId;
         ArrayList<String> scope;
         String localName;
         String kind;
         String slot;
         String methodName;
+        JsonObject metadata;
+        JsonObject ownerMetadata;
     }
 
     private static class BehaviorFunctionGroup {
@@ -10649,6 +13403,7 @@ public class AzReflectionRenamer extends GhidraScript {
 
     private static class ClassData {
         String typeName;
+        String reflectionSource;
         String typeId;
         String rttiAddress;
         String targetTypeName;
@@ -10685,28 +13440,68 @@ public class AzReflectionRenamer extends GhidraScript {
     private static class ActionStats {
         final LinkedHashMap<String, Integer> kindCounts = new LinkedHashMap<>();
         final LinkedHashMap<String, Integer> reasonCounts = new LinkedHashMap<>();
+        final LinkedHashMap<String, Integer> signatureReasonCounts = new LinkedHashMap<>();
+        int checkedSignatureCount;
         int wouldApplyCount;
         int appliedCount;
     }
 
     private class ActionSink {
         final ActionStats stats = new ActionStats();
+        final JsonObject signatureSamples = new JsonObject();
         private final boolean keepFullActions;
-        private final JsonArray fullActions;
+        private final JsonArraySpool fullActionSpool;
+        private final JsonArraySpool symbolNameSnapshots;
+        private final Set<String> capturedSymbolNames = new HashSet<>();
         private final LinkedHashMap<String, JsonArray> samplesByReason =
             new LinkedHashMap<>();
         private int actionCount;
 
         ActionSink(boolean keepFullActions) {
             this.keepFullActions = keepFullActions;
-            this.fullActions = keepFullActions ? new JsonArray() : null;
+            this.fullActionSpool = new JsonArraySpool(false, keepFullActions && !dryRun, "actions");
+            this.symbolNameSnapshots = new JsonArraySpool(false, keepFullActions && !dryRun, "symbol-names");
+        }
+
+        void captureOldNames(Address address, JsonObject action) {
+            String key = address.toString();
+            if (capturedSymbolNames.add(key)) {
+                JsonObject snapshot = new JsonObject();
+                snapshot.addProperty("address", key);
+                snapshot.add("names", oldNames(address));
+                symbolNameSnapshots.add(snapshot);
+            }
+            action.addProperty("oldNamesRef", key);
         }
 
         void add(JsonObject action) {
+            if (validating || (applyRenames && validationReport != null)) {
+                int before = validationErrors;
+                if (action.has("error")) recordValidationActionError(action, action);
+                JsonArray failures = action.getAsJsonArray("fieldFailureSamples");
+                if (failures != null) {
+                    for (JsonElement value : failures) {
+                        JsonObject failure = value.getAsJsonObject();
+                        if (failure.has("error")) recordValidationActionError(action, failure);
+                    }
+                }
+                if (!validating && validationErrors > before) throw new ReflectionActionException(action);
+            }
             actionCount++;
             increment(stats.kindCounts, stringMember(action, "kind"));
             String reason = stringMember(action, "reason");
             increment(stats.reasonCounts, reason);
+            if (boolMember(action, "signatureChecked") == Boolean.TRUE) {
+                stats.checkedSignatureCount++;
+                increment(stats.signatureReasonCounts, reason);
+                String key = stringMember(action, "kind") + "|" + (reason == null ? "none" : reason);
+                JsonArray signatures = signatureSamples.getAsJsonArray(key);
+                if (signatures == null) {
+                    signatures = new JsonArray();
+                    signatureSamples.add(key, signatures);
+                }
+                if (signatures.size() < MAX_SUMMARY_ACTION_EXAMPLES) signatures.add(actionSample(action));
+            }
             if (boolMember(action, "wouldApply") == Boolean.TRUE) {
                 stats.wouldApplyCount++;
             }
@@ -10725,7 +13520,7 @@ public class AzReflectionRenamer extends GhidraScript {
             }
 
             if (keepFullActions) {
-                fullActions.add(action);
+                fullActionSpool.add(action);
             }
         }
 
@@ -10750,7 +13545,7 @@ public class AzReflectionRenamer extends GhidraScript {
         }
 
         JsonArray fullActions() {
-            return fullActions == null ? new JsonArray() : fullActions;
+            return fullActionSpool.readArray();
         }
     }
 
@@ -10808,6 +13603,7 @@ public class AzReflectionRenamer extends GhidraScript {
     private static class DatatypeTarget {
         ArrayList<String> scope;
         CategoryPath categoryPath;
+        String canonicalPathName;
         String name;
     }
 
@@ -10874,6 +13670,7 @@ public class AzReflectionRenamer extends GhidraScript {
         int skippedInputs;
         int recordCount;
         int skippedRecords;
+        int malformedRecords;
         int recordsWithoutReturnAddress;
         int recordsWithoutClassDataAzRtti;
         int rttiBackedRecordCount;
@@ -10902,6 +13699,7 @@ public class AzReflectionRenamer extends GhidraScript {
         int skippedInputs;
         int recordCount;
         int skippedRecords;
+        int malformedRecords;
         int recordsWithoutOwner;
         int recordsWithLiveOwner;
         int recordsWithStaticOwner;
