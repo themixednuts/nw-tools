@@ -44,7 +44,13 @@ work. Plain BehaviorContext JSON takes precedence over an archive; ZIP and 7z
 entries stream without extraction. Input errors stop before program edits,
 including unreadable files, malformed registration-trace lines and explicit
 `--module-evidence`, `--class-registration` or `--field-registration` paths that
-do not exist.
+do not exist. Module captures record only the module's vtable; its name comes from
+that vtable's `RTTI_GetTypeName` slot in the binary, with a built-in table as
+fallback. A module that neither names is counted in `unrecognizedInputs` and
+skipped without blocking the import.
+Registration-trace callsites and their owning functions are resolved once before
+validation, so apply renames exactly what validation checked even after earlier
+apply phases create functions.
 TypeRegistry and previous output reports are excluded.
 BehaviorContext null UUIDs remain raw evidence and are not resolved to a class
 name, even when a serialized class explicitly uses that UUID.
@@ -283,7 +289,6 @@ register width. These are script constant families: their descriptions explicitl
 state that a prefix and return register do not establish a native C++ enum UUID
 or storage size. Dynamic getters remain unresolved; values are never inferred
 from property order or names. Existing manual enum types remain intact.
-Serialized enum fields retain their UUID/underlying-type typedefs.
 
 `behaviorContextEvidence.inventory` retains all classes, global methods and
 properties, EBuses, type-map links, on-demand registrations and constant recovery
@@ -329,9 +334,16 @@ incomplete template arguments into namespaces or invent a missing suffix.
 
 The unified entrypoint builds named, typed reflected members at their captured
 offsets,
-including bases, nested templates, pointers and enum underlying types. Native
-enum fields use named typedefs because their UUID metadata does not include
-enumerator values; BehaviorContext constant families are imported separately.
+including bases, nested templates, pointers and enums. A serialized enum field is
+either typed by the enum's UUID or, as in this capture, typed by its underlying
+scalar with an `EnumType` attribute naming the enum UUID. Both become a Ghidra
+Enum at the field's width, filled from `editContext.enumData` enumerators.
+Each constant is masked to the enum's width and sign-extended for signed
+underlying types, because the capture reads a full word past narrow enum
+storage. Enums without captured enumerators stay empty, named Enums.
+Earlier generated typedefs are replaced in place, and manual types are kept.
+`long` and `unsigned long` follow the program's data organization: 4 bytes on
+MSVC x64. BehaviorContext constant families are imported separately.
 Pointer fields reference their pointee instead of allocating a pointee structure
 with the pointer's size. Generated field placeholders can grow in place, keeping
 existing datatype IDs and references. Hand-written layouts are preserved.
@@ -369,7 +381,9 @@ custom-serializer types, unknown sizes, overlaps and unresolved ownership. When
 distinct UUIDs share a qualified C++ name, each datatype uses a separate category
 under its namespace: `/AZStd/__typeid__/<UUID>/vector<int>`, for example. The C++
 class/template name stays unchanged. Fields and `this` signatures select their
-datatype by UUID, even when the captured sizes differ. The report retains the
+datatype by UUID, even when the captured sizes differ. A field type without a
+class body does not reuse a generated type that records a different UUID at its
+canonical path; it uses its own `__typeid__/<UUID>` category instead. The report retains the
 ambiguous source name and adds `canonicalDatatypePath` and
 `identityResolution: uuid-specific-datatype`. Generated types with a known UUID
 move in place, preserving IDs and existing references. Manual canonical layouts

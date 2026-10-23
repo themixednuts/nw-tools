@@ -60,6 +60,10 @@ public class AzReflectionDatatypeIdentityTest {
                 StructureDataType oldHolder = new StructureDataType(CategoryPath.ROOT, "ExistingConsumer", 0);
                 oldHolder.add(new PointerDataType(legacy, 8, manager), "value", null);
                 oldConsumer = (Structure) manager.addDataType(oldHolder, DataTypeConflictHandler.DEFAULT_HANDLER);
+                // Another UUID's generated type already owns the canonical path of a bodyless field type.
+                StructureDataType borrowed = new StructureDataType(new CategoryPath("/Javelin"), "Borrowed", 12);
+                borrowed.setDescription("AZ SerializeContext reflected type: Javelin::Borrowed (EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE)");
+                manager.addDataType(borrowed, DataTypeConflictHandler.DEFAULT_HANDLER);
                 var mb = program.getSymbolTable().createNameSpace(program.getGlobalNamespace(), "MB", SourceType.USER_DEFINED);
                 var cls = program.getSymbolTable().createClass(mb, NAME, SourceType.USER_DEFINED);
                 firstFunction = program.getFunctionManager().createFunction("Validate", cls, base.add(0x100),
@@ -83,7 +87,9 @@ public class AzReflectionDatatypeIdentityTest {
                       {"name":"first","typeId":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","offset":"0","dataSize":"4","attributes":[]},
                       {"name":"second","typeId":"BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB","offset":"8","dataSize":"8","attributes":[]},
                       {"name":"first_ptr","typeId":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","offset":"16","dataSize":"8","is_pointer":true,"attributes":[]},
-                      {"name":"second_ptr","typeId":"BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB","offset":"24","dataSize":"8","is_pointer":true,"attributes":[]}]},
+                      {"name":"second_ptr","typeId":"BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB","offset":"24","dataSize":"8","is_pointer":true,"attributes":[]},
+                      {"name":"bodyless_ptr","typeId":"FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF","offset":"32","dataSize":"8","is_pointer":true,
+                       "azRtti":{"typeName":"Javelin::Borrowed","typeId":"FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"},"attributes":[]}]},
                   "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD":{"name":"Javelin::Unknown","typeId":"DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD","version":"1","factory":null,"attributes":[],"elements":[]}
                 }}
                 """);
@@ -110,6 +116,10 @@ public class AzReflectionDatatypeIdentityTest {
             check(((Pointer) firstFunction.getParameter(0).getDataType()).getDataType() == first &&
                 ((Pointer) secondFunction.getParameter(0).getDataType()).getDataType() == second, "this uses wrong reflected datatype");
             check(firstFunction.getParameter(0).getName().equals("this") && firstFunction.getID() == functionId, "this/function identity lost");
+            DataType bodyless = ((Pointer) holder.getComponentAt(32).getDataType()).getDataType();
+            check(bodyless.getCategoryPath().getPath().equals("/Javelin/__typeid__/FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF") &&
+                manager.getDataType(new CategoryPath("/Javelin"), "Borrowed").getLength() == 12,
+                "bodyless field borrowed another UUID's datatype: " + bodyless.getPathName());
             check(manager.getDataType(new CategoryPath("/MB"), NAME) == manual && manual.getLength() == 16 &&
                 manual.getDescription().startsWith("Hand-written"), "unidentified manual canonical layout modified");
             check(manager.getDataType(new CategoryPath("/Javelin"), "Unknown") == null, "unknown native size was invented");

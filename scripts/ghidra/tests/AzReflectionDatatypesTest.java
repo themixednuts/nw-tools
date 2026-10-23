@@ -243,7 +243,7 @@ public class AzReflectionDatatypesTest {
         set(elementType, element, "typeId", "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB");
         set(elementType, element, "typeName", "MB::FixtureEnum<Javelin::Payload>");
         DataType enumType = (DataType) call(script, "fieldDataType", new Class<?>[]{ownerType, elementType, int.class}, owner, element, 1);
-        check(enumType instanceof ghidra.program.model.data.TypeDef && enumType.getLength() == 1 &&
+        check(enumType instanceof ghidra.program.model.data.Enum && enumType.getLength() == 1 &&
             enumType.getCategoryPath().getPath().equals("/MB"), "enum keeps qualified generic identity and actual underlying type");
     }
 

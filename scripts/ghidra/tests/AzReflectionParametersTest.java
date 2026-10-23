@@ -104,7 +104,22 @@ public class AzReflectionParametersTest {
                  "azRtti":{"typeId":"E2AE1B42-7DEC-4AE8-B3E0-B263C2602E78",
                  "typeName":"TeleportContributorsAction","address":"NewWorld+0x2731ac1"},
                  "elements":[{"name":"m_value","typeId":"43DA906B-7DEF-4CA8-9790-854106D3F983",
-                   "offset":"0","dataSize":"4","is_pointer":false,"is_base_class":false,"attributes":[]}]}}}
+                   "offset":"0","dataSize":"4","is_pointer":false,"is_base_class":false,"attributes":[]},
+                  {"name":"m_long","typeId":"8F24B9AD-7C51-46CF-B2F8-277356957325",
+                   "offset":"4","dataSize":"4","is_pointer":false,"is_base_class":false,"attributes":[]},
+                  {"name":"m_mode","typeId":"72B9409A-7D1A-4831-9CFE-FCB3FADD3426",
+                   "offset":"8","dataSize":"1","is_pointer":false,"is_base_class":false,
+                   "attributes":[[2977423797,{"attributeName":"EnumType","value":{"kind":"Uuid","value":"5A1E0C2D-6B3F-4E1A-9D2C-7F8E9A0B1C2D"}}]]},
+                  {"name":"m_state","typeId":"72039442-EB38-4D42-A1AD-CB68F7E0EEF6",
+                   "offset":"12","dataSize":"4","is_pointer":false,"is_base_class":false,
+                   "attributes":[[2977423797,{"attributeName":"EnumType","value":{"kind":"Uuid","value":"6B2F1D3E-7C4A-4F2B-8E3D-9A0B1C2D3E4F"}}]]}]}},
+                 "editContext":{"enumData":[
+                  ["5A1E0C2D-6B3F-4E1A-9D2C-7F8E9A0B1C2D",{"name":"Mode","attributes":[
+                    [1,{"attributeName":"EnumValue","value":{"kind":"enumConstant","valueU64":null,"valueU32":0,"valueHighU32":0,"description":"Off"}}],
+                    [1,{"attributeName":"EnumValue","value":{"kind":"enumConstant","valueU64":"0x6e20736968542002","valueU32":1752440834,"valueHighU32":1847620457,"description":"On"}}]]}],
+                  ["6B2F1D3E-7C4A-4F2B-8E3D-9A0B1C2D3E4F",{"name":"State","attributes":[
+                    [1,{"attributeName":"EnumValue","value":{"kind":"enumConstant","valueU64":"0xffffffff","valueU32":4294967295,"valueHighU32":0,"description":"Unknown"}}],
+                    [1,{"attributeName":"EnumValue","value":{"kind":"enumConstant","valueU64":"0x1","valueU32":1,"valueHighU32":0,"description":"Ready"}}]]}]]}}
                 """);
             long reflectionId = function.getParameters()[1].getSymbol().getID();
             Structure oldThisType = (Structure) ((ghidra.program.model.data.Pointer) function.getParameters()[0].getDataType()).getDataType();
@@ -126,6 +141,18 @@ public class AzReflectionParametersTest {
             check(coreContext.getLength() == 16 && ((Structure) coreContext).getComponentAt(0).getFieldName().equals("vftable") &&
                 program.getDataTypeManager().getID(coreContext) == coreContextId, "core placeholder was replaced or left empty");
             Structure thisType = (Structure) ((ghidra.program.model.data.Pointer) parameters[0].getDataType()).getDataType();
+            DataType mode = thisType.getComponentAt(8).getDataType();
+            DataType state = thisType.getComponentAt(12).getDataType();
+            check(mode instanceof ghidra.program.model.data.Enum && mode.getName().equals("Mode") && mode.getLength() == 1 &&
+                ((ghidra.program.model.data.Enum) mode).getValue("Off") == 0 && ((ghidra.program.model.data.Enum) mode).getValue("On") == 2,
+                "EnumType u8 field is not a 1-byte enum masked to its width: " + mode);
+            check(state instanceof ghidra.program.model.data.Enum && state.getLength() == 4 &&
+                ((ghidra.program.model.data.Enum) state).getValue("Unknown") == -1 &&
+                ((ghidra.program.model.data.Enum) state).getValue("Ready") == 1,
+                "EnumType int field is not a signed 4-byte enum: " + state);
+            check(thisType.getComponentAt(4).getFieldName().equals("m_long") &&
+                thisType.getComponentAt(4).getDataType().getName().equals("long") &&
+                thisType.getComponentAt(4).getLength() == 4, "MSVC x64 long is not a 4-byte scalar: " + thisType.getComponentAt(4));
             check(thisType.getLength() == 32 && thisType.getComponentAt(0).getFieldName().equals("m_value") &&
                 program.getDataTypeManager().getID(thisType) == thisTypeId, "automatic this still points at an empty class placeholder");
             DataType opaque = program.getDataTypeManager().getDataType(CategoryPath.ROOT, "OpaqueOwner");

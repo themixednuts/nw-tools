@@ -52,6 +52,14 @@ public class AzReflectionImportTest {
                 program.getMemory().createInitializedBlock("fixture" + offset, address, 8, (byte) 0xc3, TaskMonitor.DUMMY, false).setExecute(true);
                 program.getFunctionManager().createFunction("FUN_" + offset, address, new AddressSet(address), SourceType.DEFAULT);
             }
+            // Module vtable whose slot 1 (RTTI_GetTypeName) is LEA RAX,[name]; RET.
+            var moduleVtable = program.getImageBase().add(0x2000);
+            program.getMemory().createInitializedBlock("module-vtable", moduleVtable, 16, (byte) 0, TaskMonitor.DUMMY, false);
+            program.getMemory().setLong(moduleVtable.add(8), program.getImageBase().add(0x3000).getOffset());
+            var moduleName = program.getImageBase().add(0x3000);
+            program.getMemory().createInitializedBlock("module-name", moduleName, 0x30, (byte) 0, TaskMonitor.DUMMY, false).setExecute(true);
+            program.getMemory().setBytes(moduleName, new byte[]{0x48, (byte) 0x8d, 0x05, 0x09, 0, 0, 0, (byte) 0xc3});
+            program.getMemory().setBytes(moduleName.add(0x10), "BinaryNamedModule\0".getBytes(StandardCharsets.US_ASCII));
             String serialize = """
                 {"uuidMap":{"%s":{"name":"Box","typeId":"%s","version":"1","attributes":[],
                  "azRtti":{"typeName":"MB::Box<Javelin::Payload>","typeId":"%s"},
@@ -79,6 +87,8 @@ public class AzReflectionImportTest {
             Files.writeString(resources.resolve("output"), "legacy report file: keep intact");
             Files.createDirectories(resources.resolve("modules"));
             Files.writeString(resources.resolve("modules/cry-hooks-module.json"), module);
+            Files.writeString(resources.resolve("modules/binary-named-module.json"), "{\"vftable\":\"NewWorld+0x2000\",\"descriptors\":[]}");
+            Files.writeString(resources.resolve("modules/unknown-module.json"), "{\"vftable\":\"NewWorld+0x2fff0\",\"descriptors\":[]}");
             Path output = Files.createDirectories(resources.resolve("output-directory"));
             Path priorReport = output.resolve("old-report.json");
             Files.writeString(priorReport, "{}");
@@ -98,6 +108,11 @@ public class AzReflectionImportTest {
                 validation.get("appliedCount").getAsInt() == 0, "preview saves diagnostics without program edits");
             run(program, resources);
             check(Files.readString(resources.resolve("output")).equals("legacy report file: keep intact"), "legacy output file remains intact");
+            JsonObject moduleReport = report(resources).getAsJsonObject("moduleEvidence");
+            check(moduleReport.getAsJsonArray("modules").toString().contains("\"BinaryNamedModule\"") &&
+                moduleReport.getAsJsonArray("modules").toString().contains("\"CryHooksModule\"") &&
+                moduleReport.get("unrecognizedInputs").getAsInt() == 1 && moduleReport.get("skippedInputs").getAsInt() == 0,
+                "module names come from RTTI_GetTypeName; an unnamed capture is reported without blocking: " + moduleReport);
             Structure box = type(program, "/MB", "Box<Javelin::Payload>");
             check(box.getLength() == 32 && box.getAlignment() == 16, "BehaviorContext native size and alignment extend serialized subset");
             check("m_count".equals(box.getComponentAt(0).getFieldName()), "serialized member name retained");
@@ -188,7 +203,8 @@ public class AzReflectionImportTest {
         File anchor = new File(resources, "serialize.json");
         Object modules = call(script, "loadModuleEvidence", anchor);
         set(script, "moduleEvidence", modules);
-        check((int) field(modules, "skippedInputs") == 0, "all actual module captures recognized");
+        check((int) field(modules, "skippedInputs") == 0 && (int) field(modules, "unrecognizedInputs") == 0,
+            "all actual module captures recognized");
         Object behavior = call(script, "loadBehaviorContextEvidence", anchor);
         set(script, "behaviorContextEvidence", behavior);
         check((int) field(behavior, "skippedInputs") == 0 && (int) field(behavior, "classCount") == 611,

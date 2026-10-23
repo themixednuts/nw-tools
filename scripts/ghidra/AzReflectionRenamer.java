@@ -67,15 +67,16 @@ import ghidra.program.model.data.DoubleDataType;
 import ghidra.program.model.data.FloatDataType;
 import ghidra.program.model.data.EnumDataType;
 import ghidra.program.model.data.IntegerDataType;
+import ghidra.program.model.data.LongDataType;
 import ghidra.program.model.data.LongLongDataType;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.ShortDataType;
 import ghidra.program.model.data.Structure;
 import ghidra.program.model.data.StructureDataType;
-import ghidra.program.model.data.TypedefDataType;
 import ghidra.program.model.data.UnionDataType;
 import ghidra.program.model.data.Undefined1DataType;
 import ghidra.program.model.data.UnsignedIntegerDataType;
+import ghidra.program.model.data.UnsignedLongDataType;
 import ghidra.program.model.data.UnsignedLongLongDataType;
 import ghidra.program.model.data.UnsignedShortDataType;
 import ghidra.program.model.data.VoidDataType;
@@ -206,6 +207,10 @@ public class AzReflectionRenamer extends GhidraScript {
     private File outputFile;
     private ModuleEvidenceIndex moduleEvidence;
     private ClassRegistrationEvidenceIndex classRegistrationEvidence;
+    // Built once before validation so apply renames exactly the callsites validation checked.
+    private ClassRegistrationFunctionIndex classRegistrationFunctions;
+    private FieldRegistrationFunctionIndex fieldRegistrationFunctions;
+    private final Map<String, Address> registrationCallsites = new HashMap<>();
     private FieldRegistrationEvidenceIndex fieldRegistrationEvidence;
     private BehaviorContextEvidence behaviorContextEvidence;
     private TypeEvidenceIndex typeEvidence;
@@ -228,6 +233,8 @@ public class AzReflectionRenamer extends GhidraScript {
     private Map<String, JsonObject> datatypeGenerics = Collections.emptyMap();
     private Map<String, String> datatypeNames = Collections.emptyMap();
     private final Map<String, String> enumUnderlyingTypes = new LinkedHashMap<>();
+    // editContext.enumData: enumerator names and raw constant words by enum UUID.
+    private final Map<String, EnumCapture> enumCaptures = new LinkedHashMap<>();
     private boolean nativeLayoutProfile;
     private final Set<String> datatypeConflictingPaths = new HashSet<>();
     private final Set<Namespace> templateScopeCandidates = new LinkedHashSet<>();
@@ -319,6 +326,9 @@ public class AzReflectionRenamer extends GhidraScript {
         reflectionStrings = null;
         ambiguousModuleComponentNames = new TreeSet<>();
         validationReport = null;
+        classRegistrationFunctions = null;
+        fieldRegistrationFunctions = null;
+        registrationCallsites.clear();
 
         inputFile = chooseInputFile();
         boolean requestedApply = chooseApplyRenames();
@@ -355,7 +365,9 @@ public class AzReflectionRenamer extends GhidraScript {
         currentPhase = "indexing-type-identities";
         ScanResult scan = scanSerializeContext(root);
         reconcileBehaviorTypeScopes(scan.classData);
+        classRegistrationFunctions = classRegistrationFunctionIndex(classRegistrationEvidence);
         enrichFieldRegistrationEvidence();
+        fieldRegistrationFunctions = fieldRegistrationFunctionIndex();
         println("Validating reflection and proposed layouts before program edits...");
         ActionSink previewActions = new ActionSink(false);
         validating = true;
@@ -483,7 +495,7 @@ public class AzReflectionRenamer extends GhidraScript {
         });
         runReflectionPhase("registration-traces", preview, () -> {
             processClassRegistrationTraces(classRegistrationFunctionGroups(),
-                classRegistrationFunctionIndex(classRegistrationEvidence), functionSeen, aliasSeen, actions);
+                classRegistrationFunctions, functionSeen, aliasSeen, actions);
             processFieldRegistrationTraces(functionSeen, actions);
         });
         runReflectionPhase("module-descriptors", preview, () -> processModuleDescriptorRenames(actions));
@@ -1460,7 +1472,8 @@ public class AzReflectionRenamer extends GhidraScript {
 
             String moduleName = moduleName(module);
             if (moduleName == null) {
-                index.skippedInputs++;
+                // Well-formed but unnamed captures are an evidence gap, not an input error.
+                index.unrecognizedInputs++;
                 index.skippedReasons.add(file.getName() + ":missing-module-name");
                 continue;
             }
@@ -1565,8 +1578,26 @@ public class AzReflectionRenamer extends GhidraScript {
         if (module == null || module.vftable == null) {
             return null;
         }
+        String binaryName = moduleNameFromRttiSlot(module.vftable);
+        if (binaryName != null) {
+            return binaryName;
+        }
         String offset = captureOffset(module.vftable);
         return offset == null ? null : MODULE_NAMES_BY_VTABLE.get(offset);
+    }
+
+    /** AZ::Module is AZ_RTTI: vtable slot 1 is RTTI_GetTypeName, a LEA/RET of the class name. */
+    private String moduleNameFromRttiSlot(String vftable) {
+        Address vtable = parseCaptureAddress(vftable);
+        if (!isProgramAddress(vtable)) {
+            return null;
+        }
+        Address getTypeName = readPointer(vtable.add(8));
+        if (!isProgramAddress(getTypeName) || !isExecutableAddress(getTypeName)) {
+            return null;
+        }
+        String name = stringReturnedBySimpleFunction(formatAddress(getTypeName));
+        return name != null && name.matches("[A-Za-z_][A-Za-z0-9_]*") ? name : null;
     }
 
     private String descriptorTypeId(Descriptor descriptor) {
@@ -1672,6 +1703,7 @@ public class AzReflectionRenamer extends GhidraScript {
         report.addProperty("input", index.input);
         report.addProperty("inputCount", index.inputCount);
         report.addProperty("skippedInputs", index.skippedInputs);
+        report.addProperty("unrecognizedInputs", index.unrecognizedInputs);
         report.addProperty("descriptorCount", index.descriptorCount);
         report.addProperty("ownerTypeIdCount", index.ownersByTypeId.size());
         report.addProperty("descriptorsWithoutTypeId", index.descriptorsWithoutTypeId);
@@ -1924,8 +1956,7 @@ public class AzReflectionRenamer extends GhidraScript {
         if (fieldRegistrationEvidence == null) {
             return;
         }
-        ClassRegistrationFunctionIndex functionIndex =
-            classRegistrationFunctionIndex(classRegistrationEvidence);
+        ClassRegistrationFunctionIndex functionIndex = classRegistrationFunctions;
 
         fieldRegistrationEvidence.recordsWithoutOwner = 0;
         fieldRegistrationEvidence.recordsWithoutFieldTypeName = 0;
@@ -4657,6 +4688,7 @@ public class AzReflectionRenamer extends GhidraScript {
             summary.append("\n  Descriptors: ").append(moduleEvidence.descriptorCount);
             summary.append("\n  Owner type IDs: ").append(moduleEvidence.ownersByTypeId.size());
             summary.append("\n  Skipped inputs: ").append(moduleEvidence.skippedInputs);
+            summary.append("\n  Unrecognized module captures: ").append(moduleEvidence.unrecognizedInputs);
             summary.append("\n  Duplicate type IDs: ").append(moduleEvidence.duplicateTypeIds);
         }
 
@@ -5119,6 +5151,7 @@ public class AzReflectionRenamer extends GhidraScript {
                 enumUnderlyingTypes.put(normalizeTypeId(entry.getKey()), normalizeTypeId(stringElement(entry.getValue())));
             }
         }
+        indexEnumCaptures(root.getAsJsonObject());
         nativeLayoutProfile = matchesNativeLayoutProfile();
         indexReflectedClassScopes(genericInfoByTypeId, rawTypeNamesByTypeId);
 
@@ -5955,7 +5988,7 @@ public class AzReflectionRenamer extends GhidraScript {
         rememberRawTypeName(result, "58422C0E-1E47-4854-98E6-34098F6FE12D", "s8");
         rememberRawTypeName(result, "B8A56D56-A10D-4DCE-9F63-405EE243DD3C", "s16");
         rememberRawTypeName(result, "72039442-EB38-4D42-A1AD-CB68F7E0EEF6", "s32");
-        rememberRawTypeName(result, "8F24B9AD-7C51-46CF-B2F8-277356957325", "s64");
+        rememberRawTypeName(result, "8F24B9AD-7C51-46CF-B2F8-277356957325", "long");
         rememberRawTypeName(result, "70D8A282-A1EA-462D-9D04-51EDE81FAC2F", "s64");
         rememberRawTypeName(result, "72B9409A-7D1A-4831-9CFE-FCB3FADD3426", "u8");
         rememberRawTypeName(result, "ECA0B403-C4F8-4B86-95FC-81688D046E40", "u16");
@@ -10706,6 +10739,34 @@ public class AzReflectionRenamer extends GhidraScript {
         return target;
     }
 
+    /**
+     * Types without a class body are not counted in datatypeConflictingPaths, so a canonical path can
+     * already hold another UUID's generated type. Fields select their datatype by UUID: move to this
+     * UUID's own category instead of borrowing it. Types without a recorded UUID (manual) stay shared.
+     */
+    private DatatypeTarget ownedDatatypeTarget(DatatypeTarget target, String typeId) {
+        String identity = normalizeTypeId(typeId);
+        if (target == null || identity == null || target.categoryPath.getPath().contains("/__typeid__/")) {
+            return target;
+        }
+        DataType existing = dataTypeManager.getDataType(target.categoryPath, target.name);
+        String owner = existing == null ? null : datatypeIdentity(existing);
+        if (owner == null || owner.equals(identity)) {
+            return target;
+        }
+        target.categoryPath = new CategoryPath(new CategoryPath(target.categoryPath, "__typeid__"), identity);
+        return target;
+    }
+
+    private String datatypeIdentity(DataType type) {
+        String description = type.getDescription();
+        if (description == null || !description.startsWith("AZ SerializeContext reflected")) {
+            return null;
+        }
+        Matcher identity = UUID_RE.matcher(description);
+        return identity.find() ? normalizeTypeId(identity.group()) : null;
+    }
+
     private CategoryPath datatypeCategoryPath(List<String> scope) {
         CategoryPath path = CategoryPath.ROOT;
         for (int i = 0; i < scope.size() - 1; i++) {
@@ -10870,7 +10931,7 @@ public class AzReflectionRenamer extends GhidraScript {
         pointee.typeName = name;
         pointee.targetTypeName = safeTypeName(name);
         for (int size : new int[]{1, 2, 4, 8}) {
-            if (enumUnderlyingTypes.containsKey(id)) {
+            if (enumUnderlyingTypes.containsKey(id) || enumCaptures.containsKey(id)) {
                 DataType enumType = enumFieldDataType(pointee, size);
                 if (enumType != null) return enumType;
             }
@@ -10885,7 +10946,7 @@ public class AzReflectionRenamer extends GhidraScript {
             if (existing != null) return existing;
         }
         if (name == null) return VoidDataType.dataType;
-        DatatypeTarget target = datatypeTarget(id, name);
+        DatatypeTarget target = ownedDatatypeTarget(datatypeTarget(id, name), id);
         if (target == null) return VoidDataType.dataType;
         if (datatypeConflictingPaths.contains(datatypePathName(target))) return VoidDataType.dataType;
         DataType existing = dataTypeManager.getDataType(target.categoryPath, target.name);
@@ -10905,22 +10966,124 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private DataType enumFieldDataType(ElementData element, int size) {
-        String underlyingId = enumUnderlyingTypes.get(normalizeTypeId(element.typeId));
-        if (underlyingId == null) return null;
-        ElementData underlying = new ElementData();
-        underlying.typeId = underlyingId;
-        DataType scalar = scalarFieldDataType(underlying, size);
-        if (scalar == null) return null;
-        String name = element.targetTypeName != null ? element.targetTypeName : element.typeName;
-        if (name == null) name = datatypeNames.get(normalizeTypeId(element.typeId));
-        DatatypeTarget target = datatypeTarget(element.typeId, name);
-        if (target == null) return scalar;
+        String elementTypeId = normalizeTypeId(element.typeId);
+        boolean typedAsEnum = elementTypeId != null &&
+            (enumUnderlyingTypes.containsKey(elementTypeId) || enumCaptures.containsKey(elementTypeId));
+        String enumId = typedAsEnum ? elementTypeId : element.enumTypeId;
+        if (enumId == null) return null;
+        EnumCapture capture = enumCaptures.get(enumId);
+        String underlyingId = enumUnderlyingTypes.get(enumId);
+        // An EnumType attribute on a scalar field: the field's own UUID is the underlying type.
+        if (underlyingId == null && !typedAsEnum) underlyingId = elementTypeId;
+        if (underlyingId == null && capture == null) return null;
+        if (underlyingId != null) {
+            ElementData underlying = new ElementData();
+            underlying.typeId = underlyingId;
+            if (scalarFieldDataType(underlying, size) == null) return null;
+        }
+        else if (size != 1 && size != 2 && size != 4 && size != 8) return null;
+
+        String name = typedAsEnum && element.targetTypeName != null ? element.targetTypeName : datatypeNames.get(enumId);
+        if (name == null && typedAsEnum) name = element.typeName;
+        if (name == null && capture != null) name = capture.name;
+        DatatypeTarget target = datatypeTarget(enumId, name);
+        if (target == null) return null;
         DataType existing = dataTypeManager.getDataType(target.categoryPath, target.name);
-        if (existing != null && !isGeneratedReflectedDatatype(existing)) return existing;
-        TypedefDataType result = new TypedefDataType(target.categoryPath, target.name, scalar, dataTypeManager);
+        if (existing != null && !isGeneratedEnumDatatype(existing)) return existing;
+
+        EnumDataType result = new EnumDataType(target.categoryPath, target.name, size, dataTypeManager);
+        result.setDescription("AZ SerializeContext reflected field type: enum " + name + " (" + enumId + ")" +
+            (capture == null ? "; enumerators not captured" : ""));
+        if (capture != null) addEnumConstants(result, capture, size, SIGNED_SCALAR_TYPE_IDS.contains(underlyingId));
         if (!applyRenames) return result;
-        if (existing != null && !(existing instanceof Structure)) return existing;
-        return dataTypeManager.addDataType(result, DataTypeConflictHandler.REPLACE_HANDLER);
+        if (existing == null) return dataTypeManager.addDataType(result, DataTypeConflictHandler.DEFAULT_HANDLER);
+        if (existing instanceof ghidra.program.model.data.Enum && existing.getLength() == size) {
+            if (!existing.isEquivalent(result)) {
+                existing.replaceWith(result);
+                existing.setDescription(result.getDescription());
+            }
+            return existing;
+        }
+        // Legacy generated typedef or placeholder: swap in the enum, keeping its references.
+        try {
+            return dataTypeManager.replaceDataType(existing, result, true);
+        }
+        catch (ghidra.program.model.data.DataTypeDependencyException error) {
+            return existing;
+        }
+    }
+
+    private static final Set<String> SIGNED_SCALAR_TYPE_IDS = Set.of(
+        "3AB0037F-AF8D-48CE-BCA0-A170D18B2C03", "CFD606FE-41B8-4744-B79F-8A6BD97713D8",
+        "58422C0E-1E47-4854-98E6-34098F6FE12D", "B8A56D56-A10D-4DCE-9F63-405EE243DD3C",
+        "72039442-EB38-4D42-A1AD-CB68F7E0EEF6", "8F24B9AD-7C51-46CF-B2F8-277356957325",
+        "70D8A282-A1EA-462D-9D04-51EDE81FAC2F");
+
+    /**
+     * EnumConstant stores its value at the enum's own width; the capture reads a full word, so bytes
+     * past that width are unrelated memory and are masked off.
+     */
+    private void addEnumConstants(EnumDataType result, EnumCapture capture, int size, boolean signed) {
+        HashSet<String> used = new HashSet<>();
+        for (int i = 0; i < capture.names.size(); i++) {
+            String base = safeTypeName(capture.names.get(i));
+            if (base == null) continue;
+            String name = base;
+            for (int suffix = 2; !used.add(name); suffix++) name = base + "_" + suffix;
+            long value = capture.rawValues.get(i);
+            if (size < 8) {
+                int bits = size * 8;
+                value &= (1L << bits) - 1;
+                if (signed && (value & (1L << (bits - 1))) != 0) value -= 1L << bits;
+            }
+            result.add(name, value);
+        }
+    }
+
+    private boolean isGeneratedEnumDatatype(DataType type) {
+        if (isGeneratedReflectedDatatype(type)) return true;
+        // Earlier versions wrote a typedef of a built-in scalar, whose description is the base type's.
+        return type instanceof ghidra.program.model.data.TypeDef &&
+            ((ghidra.program.model.data.TypeDef) type).getBaseDataType() instanceof ghidra.program.model.data.BuiltInDataType;
+    }
+
+    private void indexEnumCaptures(JsonObject root) {
+        enumCaptures.clear();
+        JsonObject editContext = objectMember(root, "editContext");
+        JsonArray enumData = editContext == null ? null : arrayMember(editContext, "enumData");
+        if (enumData == null) return;
+        for (JsonElement pairValue : enumData) {
+            if (!pairValue.isJsonArray() || pairValue.getAsJsonArray().size() != 2) continue;
+            String enumId = normalizeTypeId(stringElement(pairValue.getAsJsonArray().get(0)));
+            JsonObject enumObject = resolveObject(pairValue.getAsJsonArray().get(1), jsonObjectsById);
+            if (enumId == null || enumObject == null) continue;
+            EnumCapture capture = new EnumCapture();
+            capture.name = stringMember(enumObject, "name");
+            for (JsonObject attribute : elementAttributes(enumObject)) {
+                JsonObject value = objectMember(attribute, "value");
+                if (value == null || !"EnumValue".equals(stringMember(attribute, "attributeName")) ||
+                    !"enumConstant".equals(stringMember(value, "kind"))) {
+                    continue;
+                }
+                Long raw = enumConstantWord(value);
+                if (raw == null) continue;
+                capture.names.add(stringMember(value, "description"));
+                capture.rawValues.add(raw);
+            }
+            enumCaptures.put(enumId, capture);
+        }
+    }
+
+    private Long enumConstantWord(JsonObject value) {
+        String u64 = stringMember(value, "valueU64");
+        if (u64 != null) return Long.parseUnsignedLong(u64.startsWith("0x") ? u64.substring(2) : u64, 16);
+        // The dumper writes null for a zero word; the 32-bit halves remain.
+        JsonElement low = value.get("valueU32");
+        JsonElement high = value.get("valueHighU32");
+        if (low == null || !low.isJsonPrimitive()) return null;
+        long result = low.getAsLong() & 0xffffffffL;
+        if (high != null && high.isJsonPrimitive()) result |= high.getAsLong() << 32;
+        return result;
     }
 
     private DataType nestedFieldDataType(
@@ -10985,14 +11148,21 @@ public class AzReflectionRenamer extends GhidraScript {
             if ("110C4B14-11A8-4E9D-8638-5051013A56AC".equals(typeId) && dataSize == 8) {
                 return new DoubleDataType();
             }
-            if (("8F24B9AD-7C51-46CF-B2F8-277356957325".equals(typeId) ||
-                "70D8A282-A1EA-462D-9D04-51EDE81FAC2F".equals(typeId)) && dataSize == 8) {
+            if ("70D8A282-A1EA-462D-9D04-51EDE81FAC2F".equals(typeId) && dataSize == 8) {
                 return new LongLongDataType();
             }
             if (("D6597933-47CD-4FC8-B911-63F3E2B0993A".equals(typeId) ||
-                "5EC2D6F7-6859-400F-9215-C106F5B10E53".equals(typeId) ||
                 "6383F1D3-BB27-4E6B-A49A-6409B2059EAA".equals(typeId)) && dataSize == 8) {
                 return new UnsignedLongLongDataType();
+            }
+            // C++ long/unsigned long: the program's data organization sizes them (4 bytes on MSVC x64).
+            if ("8F24B9AD-7C51-46CF-B2F8-277356957325".equals(typeId)) {
+                DataType type = new LongDataType(dataTypeManager);
+                if (type.getLength() == dataSize) return type;
+            }
+            if ("5EC2D6F7-6859-400F-9215-C106F5B10E53".equals(typeId)) {
+                DataType type = new UnsignedLongDataType(dataTypeManager);
+                if (type.getLength() == dataSize) return type;
             }
         }
 
@@ -11054,7 +11224,7 @@ public class AzReflectionRenamer extends GhidraScript {
         String typeName = element.targetTypeName != null
             ? element.targetTypeName
             : safeTypeName(element.typeName);
-        DatatypeTarget target = datatypeTarget(fieldTypeId, typeName);
+        DatatypeTarget target = ownedDatatypeTarget(datatypeTarget(fieldTypeId, typeName), fieldTypeId);
         if (target == null) {
             return null;
         }
@@ -11533,19 +11703,7 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private Address classRegistrationCallsite(String returnAddress) {
-        Address address = parseCaptureAddress(returnAddress);
-        if (!isProgramAddress(address)) {
-            return null;
-        }
-        Instruction instruction = currentProgram.getListing().getInstructionBefore(address);
-        if (instruction == null || !instruction.getFlowType().isCall()) {
-            return null;
-        }
-        Address next = instruction.getMaxAddress().next();
-        if (next != null && !next.equals(address)) {
-            return null;
-        }
-        return instruction.getMinAddress();
+        return callsiteBeforeReturn(returnAddress);
     }
 
     private void processFieldRegistrationTraces(
@@ -11568,7 +11726,7 @@ public class AzReflectionRenamer extends GhidraScript {
         Set<String> functionSeen,
         ActionSink actions) throws Exception {
 
-        FieldRegistrationFunctionIndex index = fieldRegistrationFunctionIndex();
+        FieldRegistrationFunctionIndex index = fieldRegistrationFunctions;
         for (FieldRegistrationFunctionGroup group : index.recordsByFunction.values()) {
             if (monitor.isCancelled()) {
                 return;
@@ -11733,7 +11891,18 @@ public class AzReflectionRenamer extends GhidraScript {
         return builder.toString();
     }
 
+    /** Memoized per run: apply sees the callsites validation saw, even after apply disassembles code. */
     private Address callsiteBeforeReturn(String returnAddress) {
+        String key = returnAddress == null ? null : addressKey(returnAddress);
+        if (key != null && registrationCallsites.containsKey(key)) {
+            return registrationCallsites.get(key);
+        }
+        Address callsite = decodeCallsiteBeforeReturn(returnAddress);
+        if (key != null) registrationCallsites.put(key, callsite);
+        return callsite;
+    }
+
+    private Address decodeCallsiteBeforeReturn(String returnAddress) {
         Address address = parseCaptureAddress(returnAddress);
         if (!isProgramAddress(address)) {
             return null;
@@ -12989,6 +13158,7 @@ public class AzReflectionRenamer extends GhidraScript {
             element.isPointer = nativeElementIsPointer(elementObject);
             element.genericTypeIds = genericTypeIds(elementObject);
             element.callbacks = elementCallbacksFrom(elementObject);
+            element.enumTypeId = enumTypeAttributeId(elementObject);
             result.add(element);
         }
         return result;
@@ -13055,8 +13225,9 @@ public class AzReflectionRenamer extends GhidraScript {
         result.add(normalizedTypeId);
     }
 
-    private ArrayList<ElementCallback> elementCallbacksFrom(JsonObject elementObject) {
-        ArrayList<ElementCallback> result = new ArrayList<>();
+    /** Attribute objects from a reflected element's [[id, attribute], ...] pairs. */
+    private ArrayList<JsonObject> elementAttributes(JsonObject elementObject) {
+        ArrayList<JsonObject> result = new ArrayList<>();
         JsonElement attributesValue = resolveElement(elementObject.get("attributes"), jsonObjectsById);
         if (
             attributesValue == null ||
@@ -13078,23 +13249,41 @@ public class AzReflectionRenamer extends GhidraScript {
             }
             for (JsonElement attributeValue : resolvedAttributePairValue.getAsJsonArray()) {
                 JsonObject attributeObject = resolveObject(attributeValue, jsonObjectsById);
-                if (attributeObject == null) {
-                    continue;
+                if (attributeObject != null) {
+                    result.add(attributeObject);
                 }
-                JsonObject callbackValue = objectMember(attributeObject, "value");
-                if (callbackValue == null) {
-                    continue;
-                }
-                String attributeName = safeTypeName(stringMember(attributeObject, "attributeName"));
-                if (attributeName == null) {
-                    continue;
-                }
-
-                addElementCallback(result, attributeName, callbackValue, "function");
-                addElementCallback(result, attributeName, callbackValue, "memberFunction");
             }
         }
         return result;
+    }
+
+    private ArrayList<ElementCallback> elementCallbacksFrom(JsonObject elementObject) {
+        ArrayList<ElementCallback> result = new ArrayList<>();
+        for (JsonObject attributeObject : elementAttributes(elementObject)) {
+            JsonObject callbackValue = objectMember(attributeObject, "value");
+            if (callbackValue == null) {
+                continue;
+            }
+            String attributeName = safeTypeName(stringMember(attributeObject, "attributeName"));
+            if (attributeName == null) {
+                continue;
+            }
+
+            addElementCallback(result, attributeName, callbackValue, "function");
+            addElementCallback(result, attributeName, callbackValue, "memberFunction");
+        }
+        return result;
+    }
+
+    private String enumTypeAttributeId(JsonObject elementObject) {
+        for (JsonObject attributeObject : elementAttributes(elementObject)) {
+            JsonObject value = objectMember(attributeObject, "value");
+            if (value != null && "EnumType".equals(stringMember(attributeObject, "attributeName")) &&
+                "Uuid".equals(stringMember(value, "kind"))) {
+                return normalizeTypeId(stringMember(value, "value"));
+            }
+        }
+        return null;
     }
 
     private void addElementCallback(
@@ -13429,6 +13618,14 @@ public class AzReflectionRenamer extends GhidraScript {
         boolean isPointer;
         ArrayList<String> genericTypeIds;
         ArrayList<ElementCallback> callbacks;
+        // EnumType attribute: serialized as its underlying scalar, edited as this enum UUID.
+        String enumTypeId;
+    }
+
+    private static class EnumCapture {
+        String name;
+        final ArrayList<String> names = new ArrayList<>();
+        final ArrayList<Long> rawValues = new ArrayList<>();
     }
 
     private static class ElementCallback {
@@ -13798,6 +13995,7 @@ public class AzReflectionRenamer extends GhidraScript {
         String input;
         int inputCount;
         int skippedInputs;
+        int unrecognizedInputs;
         int descriptorCount;
         int descriptorsWithoutTypeId;
         int duplicateTypeIds;
