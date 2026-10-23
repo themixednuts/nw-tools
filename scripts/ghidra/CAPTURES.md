@@ -24,7 +24,7 @@ Serialized enum fields in this capture are always scalars with an `EnumType`
 attribute (257 fields, 241 with enumerators). None use the enum UUID as their
 `typeId`.
 
-## `behavior-context.json` (BehaviorContext, 482 MB; also `.json.zip` / `.7z`)
+## `behavior-context.json` (BehaviorContext, 823 MB; also `.json.zip` / `.7z`)
 
 Every record appears twice, once under its native `m_*` name and once under a
 normalized alias (`m_methods`/`methods`, `m_name`/`name`, ...). The importer
@@ -33,15 +33,37 @@ reads each value once.
 | Section | Contents | Ghidra destination |
 | --- | --- | --- |
 | `classes` (611) | `typeId`, `size`, `alignment`, `azRtti`, `baseClasses`, `requestBuses`, allocator/constructor/destructor/cloner/mover pointers, `methods[]`, `properties[]`, `attributes` | Struct size and alignment, `Method<owner::fn>` aliases, class facts in datatype descriptions |
-| method record | `m_name` (`Class::Fn`), `m_isConst`, `m_debugDescription`, `m_functionPtr` (implementation), `vtable` (BehaviorMethod adapter), `m_reflectFunction[]`, `virtualDispatchSlotOffset` | Implementation, adapter `vftable` and `Reflect<0xRVA>` aliases |
+| method record | `m_name` (`Class::Fn`), `m_isConst`, `m_debugDescription`, `m_functionPtr` (implementation), `vtable` (BehaviorMethod adapter), `m_reflectFunction[]`, `virtualDispatchSlotOffset`, `signature` | Implementation, adapter `vftable` and `Reflect<0xRVA>` aliases; the implementation's prototype |
+| `signature` (16,341 methods) | `result` and `arguments[]` as `{name, typeId, azRtti, traits}`, `argumentMetadata[]` (`name`, `toolTip`, `defaultValue`), the decoded `accessors`, `error` when an accessor has another shape | `__fastcall` prototype in the MSVC x64 ABI (see below) |
 | `methods` / `properties` (9 / 2,647) | Global methods. Properties are mostly enum constants exposed as getters. | Function names; constant-family Enums under `/AZ/BehaviorContext/Constants` |
 | `ebuses` (626) | `events[]` with Broadcast/Event/Queue* function pointers, `idParam`, `virtualProperties` | Bus event function names and comments |
 | `typeToClassMap`, `m_onDemandReflection` | UUID → class record; on-demand reflector functions | Joins and `Reflect` names |
 
-Method records carry no argument or result types. The binary is built without
-MSVC RTTI, so adapter vtables do not encode signatures either. Typing
-parameters beyond `this` would need the dumper to capture each
-`BehaviorMethod`'s `BehaviorParameter` array.
+`signature` comes from nw-windbg's `behavior-method-signature.ts`, which
+decodes each method's `GetNumArguments`, `GetArgument`, `GetArgumentName` and
+`GetResult` bodies. `name` is the C++ spelling (`const Vector3&`) and `typeId`
+names the stripped type. `traits` are `BehaviorParameter::Traits`: 1 pointer,
+2 const, 4 reference, 8 receiver (`this`), 16 string, so pointer and reference
+bits give the indirection depth (`T*&` is 5). Argument 0 of a member method
+carries the receiver bit.
+
+The importer models what the binary does rather than Ghidra's default
+convention. Every by-value class result, including 4- and 8-byte ones such as
+`Crc32` and `EntityId`, comes back through a caller buffer named `result`.
+That buffer follows the receiver (RCX `this`, RDX `result`) or comes first in a
+free function. By-value classes that are not 1, 2, 4 or 8 bytes are passed by
+address. Scalars and enums stay in registers. A body that several signatures
+share is typed only when they agree; a by-value type without a known size skips
+the whole prototype.
+
+The signature describes the script-facing call, which matches the native function
+for methods, property getters and setters, and constructors. An EBus event's
+Broadcast, Event and Queue variants all point at the bus interface's member, usually
+a `mov rax,[rcx]; jmp [rax+slot]` thunk. That member takes the handler as an
+unlisted `void *this`, and the Event variants' leading bus id is not one of its
+parameters. Other EBus callbacks (`createHandler`, `destroyHandler`,
+`getCurrentId`, `queueFunction`) are not typed until their shapes are checked
+against the binary.
 
 ## `modules/*.json` (36 files)
 

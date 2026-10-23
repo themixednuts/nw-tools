@@ -134,6 +134,27 @@ public class AzReflectionRenamer extends GhidraScript {
     private static final int MAX_CREATE_COMPONENT_CALLS = 32;
     private static final int MAX_CONSTRUCTOR_VTABLE_CANDIDATES = 8;
     private static final int MAX_VPTR_STORE_LOOKAHEAD = 8;
+    /** AZ::BehaviorParameter::Traits bits the signature dump records. */
+    private static final long BEHAVIOR_TRAIT_POINTER = 1;
+    private static final long BEHAVIOR_TRAIT_REFERENCE = 4;
+    private static final long BEHAVIOR_TRAIT_THIS_PTR = 8;
+    private static final String BEHAVIOR_CALLING_CONVENTION = "__fastcall";
+    private static final String BEHAVIOR_RESULT_BUFFER_NAME = "result";
+    /** Candidate kinds whose native function takes exactly the captured signature. */
+    private static final Set<String> BEHAVIOR_SIGNATURE_KINDS = Set.of(
+        "global.method", "global.property.getter", "global.property.setter", "class.constructor",
+        "class.method", "class.property.getter", "class.property.setter");
+    private static final String VOID_TYPE_ID = "C0F1AFAD-5CB3-450E-B0F5-ADB5D46B0E22";
+    /** AzTypeInfo ids of the scalars MSVC passes and returns in registers. */
+    private static final Set<String> BEHAVIOR_SCALAR_TYPE_IDS = Set.of(
+        "A0CA880C-AFE4-43CB-926C-59AC48496112", "3AB0037F-AF8D-48CE-BCA0-A170D18B2C03",
+        "CFD606FE-41B8-4744-B79F-8A6BD97713D8", "58422C0E-1E47-4854-98E6-34098F6FE12D",
+        "72B9409A-7D1A-4831-9CFE-FCB3FADD3426", "B8A56D56-A10D-4DCE-9F63-405EE243DD3C",
+        "ECA0B403-C4F8-4B86-95FC-81688D046E40", "72039442-EB38-4D42-A1AD-CB68F7E0EEF6",
+        "43DA906B-7DEF-4CA8-9790-854106D3F983", "EA2C3E90-AFBE-44D4-A90D-FAAF79BAF93D",
+        "110C4B14-11A8-4E9D-8638-5051013A56AC", "70D8A282-A1EA-462D-9D04-51EDE81FAC2F",
+        "D6597933-47CD-4FC8-B911-63F3E2B0993A", "8F24B9AD-7C51-46CF-B2F8-277356957325",
+        "5EC2D6F7-6859-400F-9215-C106F5B10E53");
     private static final String PREFS_NODE = "newworld/az_serialize_context_renamer";
     private static final String PREF_LAST_INPUT_DIR = "lastInputDirectory";
     private static final String CORE_REFLECTION_DATATYPE_DESCRIPTION_PREFIX =
@@ -3365,8 +3386,10 @@ public class AzReflectionRenamer extends GhidraScript {
         candidate.slot = behaviorVirtualSlot(method);
         candidate.methodName = behaviorName(method, null);
         candidate.metadata = compactBehaviorMetadata(method).getAsJsonObject();
+        candidate.metadata.remove("signature");
+        candidate.signature = behaviorSignature(method);
         countBehaviorAttributes(behaviorArray(method, "m_attributes"), index);
-        if (!method.has("m_arguments") && !method.has("arguments") && !method.has("parameters")) {
+        if (candidate.signature == null) {
             increment(index.unresolvedCounts, "method-signature-not-captured");
         }
         index.functionCandidates.add(candidate);
@@ -3445,8 +3468,285 @@ public class AzReflectionRenamer extends GhidraScript {
                 return;
             }
         }
+        processBehaviorSignatures(index, actions);
         applyBehaviorClassFacts(index, actions);
         processBehaviorConstants(index, actions);
+    }
+
+    private BehaviorSignature behaviorSignature(JsonObject method) {
+        JsonObject captured = objectMemberDirect(method, "signature");
+        if (captured == null) return null;
+        BehaviorSignature signature = new BehaviorSignature();
+        signature.error = stringMemberDirect(captured, "error");
+        signature.result = behaviorParameter(captured.get("result"), null);
+        JsonElement arguments = captured.get("arguments");
+        JsonElement metadata = captured.get("argumentMetadata");
+        JsonArray names = metadata != null && metadata.isJsonArray() ? metadata.getAsJsonArray() : null;
+        if (arguments != null && arguments.isJsonArray()) {
+            JsonArray values = arguments.getAsJsonArray();
+            for (int i = 0; i < values.size(); i++) {
+                JsonObject argumentMetadata = names != null && i < names.size() ? resolveBehaviorObject(names.get(i)) : null;
+                signature.arguments.add(behaviorParameter(values.get(i), stringMemberDirect(argumentMetadata, "name")));
+            }
+        }
+        return signature;
+    }
+
+    private BehaviorParameterRecord behaviorParameter(JsonElement value, String argumentName) {
+        JsonObject object = resolveBehaviorObject(value);
+        if (object == null || object.has("error")) return null;
+        Long traits = longMemberDirect(object, "traits");
+        String typeId = normalizeTypeId(stringMemberDirect(object, "typeId"));
+        if (traits == null || typeId == null) return null;
+        BehaviorParameterRecord parameter = new BehaviorParameterRecord();
+        parameter.spelling = stringMemberDirect(object, "name");
+        parameter.typeId = typeId;
+        parameter.traits = traits;
+        parameter.argumentName = argumentName;
+        return parameter;
+    }
+
+    /**
+     * Types each BehaviorContext function from its captured signature in the MSVC x64 ABI the binary uses: the
+     * receiver in RCX, a by-value class result through a caller buffer passed after the receiver, and by-value
+     * classes other than 1/2/4/8 bytes passed by address. A body several signatures share is typed only when
+     * they agree.
+     */
+    private void processBehaviorSignatures(BehaviorContextEvidence index, ActionSink actions) throws Exception {
+        for (BehaviorFunctionGroup group : index.groupsByAddress.values()) {
+            monitor.checkCancelled();
+            ArrayList<BehaviorPrototype> prototypes = new ArrayList<>();
+            for (BehaviorFunctionCandidate candidate : group.candidates) {
+                if (candidate.signature != null) prototypes.add(behaviorPrototype(candidate));
+            }
+            if (prototypes.isEmpty()) continue;
+            JsonObject action = new JsonObject();
+            action.addProperty("kind", "behavior_signature");
+            action.addProperty("address", group.address);
+            action.addProperty("name", fullName(group.candidates.get(0).scope, group.candidates.get(0).localName));
+            action.addProperty("signatureCount", prototypes.size());
+            BehaviorPrototype prototype = agreedBehaviorPrototype(prototypes, action);
+            if (prototype != null) applyBehaviorPrototype(group.address, prototype, action);
+            actions.add(action);
+        }
+    }
+
+    private BehaviorPrototype agreedBehaviorPrototype(List<BehaviorPrototype> prototypes, JsonObject action) {
+        LinkedHashSet<String> keys = new LinkedHashSet<>();
+        for (BehaviorPrototype prototype : prototypes) {
+            if (prototype.skipReason != null) {
+                action.addProperty("applied", false);
+                action.addProperty("reason", prototype.skipReason);
+                if (prototype.skipDetail != null) action.addProperty("detail", prototype.skipDetail);
+                return null;
+            }
+            keys.add(prototype.key);
+        }
+        if (keys.size() != 1) {
+            action.addProperty("applied", false);
+            action.addProperty("reason", "shared-body-signature-conflict");
+            JsonArray conflicting = new JsonArray();
+            for (String key : keys) conflicting.add(key);
+            action.add("signatures", conflicting);
+            return null;
+        }
+        BehaviorPrototype agreed = prototypes.get(0);
+        for (BehaviorPrototype other : prototypes) {
+            for (int i = 0; i < agreed.names.size(); i++) {
+                if (!agreed.names.get(i).equals(other.names.get(i))) agreed.names.set(i, "arg" + i);
+            }
+        }
+        return agreed;
+    }
+
+    /**
+     * The native function's prototype for one candidate. Methods, properties and constructors point at a function
+     * whose parameters are the signature's. An EBus event points at the bus interface's member (usually a vcall
+     * thunk) for every dispatch variant, so the handler is an unlisted receiver and the Event variants' leading
+     * bus id is not a parameter. Other callbacks have shapes not yet checked against the binary.
+     */
+    private BehaviorPrototype behaviorPrototype(BehaviorFunctionCandidate candidate) {
+        BehaviorSignature signature = candidate.signature;
+        BehaviorPrototype prototype = new BehaviorPrototype();
+        String kind = candidate.kind == null ? "" : candidate.kind;
+        boolean interfaceMember = kind.startsWith("ebus.event.") || kind.startsWith("ebus.virtualProperty.");
+        if (!interfaceMember && !BEHAVIOR_SIGNATURE_KINDS.contains(kind)) {
+            prototype.skipReason = "signature-kind-unverified";
+            prototype.skipDetail = kind;
+            return prototype;
+        }
+        if (signature.error != null) {
+            prototype.skipReason = "signature-not-decoded";
+            prototype.skipDetail = signature.error;
+            return prototype;
+        }
+        if (signature.result == null || signature.arguments.contains(null)) {
+            prototype.skipReason = "signature-parameter-unreadable";
+            return prototype;
+        }
+        List<BehaviorParameterRecord> formals = signature.arguments;
+        if (interfaceMember) {
+            if (kind.endsWith(".event") || kind.endsWith(".queueEvent")) {
+                if (formals.isEmpty()) {
+                    prototype.skipReason = "ebus-event-without-bus-id";
+                    return prototype;
+                }
+                formals = formals.subList(1, formals.size());
+            }
+            prototype.names.add("this");
+            prototype.types.add(new PointerDataType(VoidDataType.dataType, dataTypeManager));
+        }
+        else if (!formals.isEmpty() && (formals.get(0).traits & BEHAVIOR_TRAIT_THIS_PTR) != 0) {
+            DataType type = behaviorParameterType(formals.get(0), prototype);
+            if (type == null) return prototype;
+            prototype.names.add("this");
+            prototype.types.add(type);
+            formals = formals.subList(1, formals.size());
+        }
+        BehaviorParameterRecord result = signature.result;
+        if (VOID_TYPE_ID.equals(result.typeId) && indirection(result) == 0) {
+            prototype.returnType = VoidDataType.dataType;
+        }
+        else if (indirection(result) == 0 && isBehaviorClassValue(result.typeId)) {
+            // MSVC returns a class through a caller buffer whatever its size; the buffer follows the receiver.
+            DataType buffer = new PointerDataType(behaviorValueType(result), dataTypeManager);
+            // A plain name: Ghidra turns __return_storage_ptr__ into its own hidden return ahead of the receiver.
+            prototype.names.add(BEHAVIOR_RESULT_BUFFER_NAME);
+            prototype.types.add(buffer);
+            prototype.returnType = buffer;
+        }
+        else {
+            prototype.returnType = behaviorParameterType(result, prototype);
+            if (prototype.returnType == null) return prototype;
+        }
+        for (int i = 0; i < formals.size(); i++) {
+            DataType type = behaviorParameterType(formals.get(i), prototype);
+            if (type == null) return prototype;
+            prototype.names.add(behaviorArgumentName(formals.get(i), i + 1));
+            prototype.types.add(type);
+        }
+        HashSet<String> used = new HashSet<>();
+        for (int i = 0; i < prototype.names.size(); i++) {
+            String name = prototype.names.get(i);
+            for (int suffix = 2; !used.add(name); suffix++) name = prototype.names.get(i) + "_" + suffix;
+            prototype.names.set(i, name);
+        }
+        StringBuilder key = new StringBuilder(prototype.returnType.getPathName()).append('(');
+        for (DataType type : prototype.types) key.append(type.getPathName()).append(',');
+        prototype.key = key.append(')').toString();
+        return prototype;
+    }
+
+    /** A parameter's formal type: its pointer/reference levels over the value type, by-value classes by size. */
+    private DataType behaviorParameterType(BehaviorParameterRecord parameter, BehaviorPrototype prototype) {
+        int levels = indirection(parameter);
+        DataType value = behaviorValueType(parameter);
+        if (levels > 0) {
+            DataType type = value == null ? VoidDataType.dataType : value;
+            for (int level = 0; level < levels; level++) {
+                type = new PointerDataType(type, dataTypeManager);
+            }
+            return type;
+        }
+        if (value == null || value instanceof VoidDataType || value.isZeroLength() || value.getLength() <= 0) {
+            prototype.skipReason = "parameter-size-unknown";
+            prototype.skipDetail = parameter.spelling + " (" + parameter.typeId + ")";
+            return null;
+        }
+        int size = value.getLength();
+        if (isBehaviorClassValue(parameter.typeId) && size != 1 && size != 2 && size != 4 && size != 8) {
+            // MSVC passes larger by-value classes as the address of a caller copy.
+            return new PointerDataType(value, dataTypeManager);
+        }
+        return value;
+    }
+
+    private DataType behaviorValueType(BehaviorParameterRecord parameter) {
+        if (VOID_TYPE_ID.equals(parameter.typeId)) return VoidDataType.dataType;
+        ElementData element = new ElementData();
+        element.typeId = parameter.typeId;
+        element.typeName = behaviorValueSpelling(parameter.spelling);
+        return pointeeDataType(null, element);
+    }
+
+    /** The spelling without cv-qualifiers or the pointer/reference declarators the traits already carry. */
+    private String behaviorValueSpelling(String spelling) {
+        if (spelling == null) return null;
+        String value = spelling.trim();
+        while (value.endsWith("*") || value.endsWith("&")) value = value.substring(0, value.length() - 1).trim();
+        while (value.startsWith("const ")) value = value.substring(6).trim();
+        return value.isEmpty() ? null : value;
+    }
+
+    private int indirection(BehaviorParameterRecord parameter) {
+        return Long.bitCount(parameter.traits & (BEHAVIOR_TRAIT_POINTER | BEHAVIOR_TRAIT_REFERENCE));
+    }
+
+    /** Scalars and enums travel in registers; every other reflected value is a class type. */
+    private boolean isBehaviorClassValue(String typeId) {
+        return !BEHAVIOR_SCALAR_TYPE_IDS.contains(typeId) && !VOID_TYPE_ID.equals(typeId) &&
+            !enumUnderlyingTypes.containsKey(typeId) && !enumCaptures.containsKey(typeId);
+    }
+
+    private String behaviorArgumentName(BehaviorParameterRecord parameter, int ordinal) {
+        String name = parameter.argumentName == null ? "" : parameter.argumentName.replaceAll("[^A-Za-z0-9_]", "_");
+        if (name.isEmpty() || Character.isDigit(name.charAt(0)) || name.equals("this") ||
+            name.equals(BEHAVIOR_RESULT_BUFFER_NAME) || name.equals(Function.RETURN_PTR_PARAM_NAME)) {
+            return "arg" + ordinal;
+        }
+        return name;
+    }
+
+    private void applyBehaviorPrototype(String address, BehaviorPrototype prototype, JsonObject action) throws Exception {
+        action.addProperty("returnType", prototype.returnType.getPathName());
+        JsonArray planned = new JsonArray();
+        for (int i = 0; i < prototype.names.size(); i++) {
+            planned.add(prototype.types.get(i).getPathName() + " " + prototype.names.get(i));
+        }
+        action.add("parameters", planned);
+        Function function = functionAtCaptureAddress(address, action);
+        if (function == null) return;
+        action.addProperty("function", function.getName(true));
+        if (function.hasCustomVariableStorage()) {
+            action.addProperty("applied", false);
+            action.addProperty("reason", "custom-storage-preserved");
+            return;
+        }
+        if (hasBehaviorPrototype(function, prototype)) {
+            action.addProperty("applied", false);
+            action.addProperty("reason", "already-current");
+            return;
+        }
+        if (!applyRenames) {
+            action.addProperty("applied", false);
+            action.addProperty("wouldApply", true);
+            action.addProperty("reason", "dry-run");
+            return;
+        }
+        ArrayList<Parameter> parameters = new ArrayList<>();
+        for (int i = 0; i < prototype.names.size(); i++) {
+            parameters.add(new ParameterImpl(prototype.names.get(i), prototype.types.get(i), currentProgram,
+                SourceType.USER_DEFINED));
+        }
+        function.updateFunction(BEHAVIOR_CALLING_CONVENTION, new ReturnParameterImpl(prototype.returnType, currentProgram),
+            parameters, FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, true, SourceType.USER_DEFINED);
+        action.addProperty("applied", true);
+    }
+
+    private boolean hasBehaviorPrototype(Function function, BehaviorPrototype prototype) {
+        if (!BEHAVIOR_CALLING_CONVENTION.equals(function.getCallingConventionName()) ||
+            !sameDataType(function.getReturnType(), prototype.returnType)) {
+            return false;
+        }
+        Parameter[] parameters = function.getParameters();
+        if (parameters.length != prototype.names.size()) return false;
+        for (int i = 0; i < parameters.length; i++) {
+            if (parameters[i].isAutoParameter() || !parameters[i].getName().equals(prototype.names.get(i)) ||
+                !sameDataType(parameters[i].getDataType(), prototype.types.get(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void applyBehaviorClassFacts(BehaviorContextEvidence index, ActionSink actions) {
@@ -4791,6 +5091,7 @@ public class AzReflectionRenamer extends GhidraScript {
         appendCount(summary, stats.kindCounts, "behavior_virtual_dispatch_use");
         appendCount(summary, stats.kindCounts, "behavior_event_builder_use");
         appendCount(summary, stats.kindCounts, "behavior_shared_function");
+        appendCount(summary, stats.kindCounts, "behavior_signature");
         appendCount(summary, stats.kindCounts, "behavior_comment");
 
         appendActionExamples(summary, actions, "dry-run", "Ready rename examples");
@@ -11403,7 +11704,7 @@ public class AzReflectionRenamer extends GhidraScript {
         EnumDataType result = new EnumDataType(target.categoryPath, target.name, size, dataTypeManager);
         result.setDescription("AZ SerializeContext reflected field type: enum " + name + " (" + enumId + ")" +
             (capture == null ? "; enumerators not captured" : ""));
-        if (capture != null) addEnumConstants(result, capture, size, SIGNED_SCALAR_TYPE_IDS.contains(underlyingId));
+        if (capture != null) addEnumConstants(result, capture, size, underlyingId != null && SIGNED_SCALAR_TYPE_IDS.contains(underlyingId));
         if (!applyRenames) return result;
         if (existing == null) return dataTypeManager.addDataType(result, DataTypeConflictHandler.DEFAULT_HANDLER);
         if (existing instanceof ghidra.program.model.data.Enum && existing.getLength() == size) {
@@ -13998,6 +14299,32 @@ public class AzReflectionRenamer extends GhidraScript {
         String methodName;
         JsonObject metadata;
         JsonObject ownerMetadata;
+        BehaviorSignature signature;
+    }
+
+    /** A BehaviorMethod's declared signature, read by the dumper through its own argument accessors. */
+    private static class BehaviorSignature {
+        BehaviorParameterRecord result;
+        final ArrayList<BehaviorParameterRecord> arguments = new ArrayList<>();
+        String error;
+    }
+
+    /** One BehaviorParameter: the C++ spelling, the stripped type's UUID and its BehaviorParameter::Traits. */
+    private static class BehaviorParameterRecord {
+        String spelling;
+        String typeId;
+        long traits;
+        String argumentName;
+    }
+
+    /** The prototype one candidate's signature asks for; `key` compares candidates that share a body. */
+    private static class BehaviorPrototype {
+        final ArrayList<String> names = new ArrayList<>();
+        final ArrayList<DataType> types = new ArrayList<>();
+        DataType returnType;
+        String key;
+        String skipReason;
+        String skipDetail;
     }
 
     private static class BehaviorFunctionGroup {

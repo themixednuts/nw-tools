@@ -325,6 +325,23 @@ evidence. It removes duplicate alias copies while preserving unique fields and
 unknown attributes. Captured API properties and bases without object offsets do
 not supply invented structure fields or method signatures.
 
+BehaviorContext method records with a captured `signature` type their
+implementation as `__fastcall` in the MSVC x64 ABI the binary uses. A member
+method takes an explicit `this` first. A by-value class result (any size) is
+returned through a `result` buffer after the receiver, and by-value classes other
+than 1, 2, 4 or 8 bytes are passed by address. EBus events type the bus
+interface's member that every dispatch variant points at: a `void *this` handler,
+then the Broadcast arguments (the Event variants' bus id is dropped). A body whose
+signatures disagree, a by-value type without a known size, an undecoded signature,
+custom storage, or an EBus callback whose shape is not yet verified is skipped and
+reported as a `behavior_signature` action.
+
+`tests/AzBehaviorSignatureTest.java` checks receivers, class results through caller
+buffers with their register order, large by-value classes, float registers,
+argument names, EBus interface members, shared-body conflicts, unsized types,
+undecoded signatures, unverified callbacks and retries. Its arguments are the Ghidra installation directory and a temporary
+output directory.
+
 `tests/AzBehaviorContextTest.java` verifies applied symbols, datatype descriptions,
 constant values, exact uint64 attributes, all EBus dispatch variants, virtual
 properties, shared owners, normalized records, map-only classes, manual conflicts,
