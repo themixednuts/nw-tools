@@ -18,6 +18,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -27,6 +28,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.prefs.Preferences;
@@ -160,24 +162,6 @@ public class AzReflectionRenamer extends GhidraScript {
         "EnumHierarchy",
     };
 
-    private static final String[] SERIALIZE_RTTI_SLOT_NAMES = {
-        "GetTypeId",
-        "GetTypeName",
-        "IsTypeOf",
-        "EnumHierarchy",
-        "CastConst",
-        "Cast",
-    };
-
-    private static final String[] INFERRED_STATIC_RTTI_SLOT_NAMES = {
-        "GetTypeId",
-        "GetTypeName",
-        "IsTypeOf",
-        "EnumHierarchy",
-        "CastConst",
-        "Cast",
-    };
-
     private static final String[] AZ_RTTI_INSTANCE_SLOT_NAMES = {
         "GetType",
         "GetTypeName",
@@ -186,6 +170,9 @@ public class AzReflectionRenamer extends GhidraScript {
         "AddressOfConst",
         "AddressOf",
     };
+
+    /** Every local name the RTTI passes give, including the six-slot names earlier imports used. */
+    private static final Set<String> GENERATED_RTTI_NAMES = generatedRttiNames();
 
     private static final String[] OBJECT_FIELDS = {
         "factory",
@@ -197,7 +184,18 @@ public class AzReflectionRenamer extends GhidraScript {
 
     private static final Map<String, String> FUNCTION_FIELDS = functionFieldNames();
 
+    private static Set<String> generatedRttiNames() {
+        LinkedHashSet<String> names = new LinkedHashSet<>(Arrays.asList(RTTI_SLOT_NAMES));
+        names.addAll(Arrays.asList(AZ_RTTI_INSTANCE_SLOT_NAMES));
+        names.add("Uuid");
+        return Collections.unmodifiableSet(names);
+    }
+
     private SymbolTable symbols;
+    /** AZ_RTTI blocks the captures located; the string scan leaves them alone. */
+    private final Set<String> capturedRttiBlocks = new HashSet<>();
+    /** UUIDs each captured RTTI or serialized type name is given. */
+    private Map<String, LinkedHashSet<String>> capturedRttiTypeIdsByName = new HashMap<>();
     private DataTypeManager dataTypeManager;
     private Map<String, Structure> declaredStructuresByTypeId = Collections.emptyMap();
     private final Map<String, Structure> previewCoreDatatypes = new HashMap<>();
@@ -409,6 +407,8 @@ public class AzReflectionRenamer extends GhidraScript {
         report.addProperty("applyRenames", applyRenames);
         report.addProperty("dryRun", dryRun);
         report.addProperty("rttiTypeCount", scan.rttiTypes.size());
+        report.addProperty("capturedRttiHelperCount", scan.capturedRttiHelpers.size());
+        report.addProperty("capturedTypeIdGetterCount", scan.capturedTypeIdGetters.size());
         report.addProperty("classDataCount", scan.classData.size());
         report.addProperty("elementCallbackCount", elementCallbackCount(scan.classData));
         report.addProperty("moduleDescriptorCount", moduleEvidence.descriptorCount);
@@ -458,7 +458,6 @@ public class AzReflectionRenamer extends GhidraScript {
 
     private JsonObject runReflectionPass(JsonElement root, ScanResult scan, ActionSink actions, boolean preview)
         throws Exception {
-        Map<String, SlotGroup> rttiGroups = rttiSlotGroups(scan.rttiTypes.values(), SERIALIZE_RTTI_SLOT_NAMES);
         Map<String, SlotGroup> callbacks = callbackGroups(scan.classData);
         Set<String> functionSeen = new HashSet<>();
         Set<String> aliasSeen = new HashSet<>();
@@ -472,10 +471,11 @@ public class AzReflectionRenamer extends GhidraScript {
             monitor.initialize(scan.rttiTypes.size());
             for (RttiType type : scan.rttiTypes.values()) {
                 monitor.setMessage("RTTI names: " + type.targetTypeName);
-                processRttiType(type, SERIALIZE_RTTI_SLOT_NAMES, rttiGroups, functionSeen, aliasSeen, actions);
+                processRttiType(type, actions);
                 monitor.incrementProgress(1);
                 monitor.checkCancelled();
             }
+            processRttiNames(scan, functionSeen, actions);
         });
         runReflectionPhase("serialize-callbacks", preview, () -> {
             monitor.initialize(scan.classData.size());
@@ -500,7 +500,7 @@ public class AzReflectionRenamer extends GhidraScript {
         });
         runReflectionPhase("module-descriptors", preview, () -> processModuleDescriptorRenames(actions));
         runReflectionPhase("inferred-static-rtti", preview,
-            () -> processInferredStaticRttiHelperVtables(functionSeen, aliasSeen, actions));
+            () -> processInferredStaticRttiHelperVtables(functionSeen, actions));
         runReflectionPhase("behavior-context-apis-and-buses", preview,
             () -> processBehaviorContextEvidence(behaviorContextEvidence, functionSeen, aliasSeen, actions));
         runReflectionPhase("mb-names-and-reflection-signatures", preview, () -> {
@@ -555,6 +555,7 @@ public class AzReflectionRenamer extends GhidraScript {
         ambiguousModuleComponentNames.clear();
         datatypeConflictingPaths.clear();
         templateScopeCandidates.clear();
+        capturedRttiBlocks.clear();
         declaredStructuresByTypeId = Collections.emptyMap();
         previewCoreDatatypes.clear();
     }
@@ -590,6 +591,8 @@ public class AzReflectionRenamer extends GhidraScript {
             Math.max(0, validationErrors - MAX_VALIDATION_ERROR_SAMPLES));
         validationReport.addProperty("nativeLayoutProfile", nativeLayoutProfile);
         validationReport.addProperty("rttiTypeCount", scan.rttiTypes.size());
+        validationReport.addProperty("capturedRttiHelperCount", scan.capturedRttiHelpers.size());
+        validationReport.addProperty("capturedTypeIdGetterCount", scan.capturedTypeIdGetters.size());
         validationReport.addProperty("classDataCount", scan.classData.size());
         validationReport.addProperty("moduleDescriptorCount", moduleEvidence.descriptorCount);
         validationReport.addProperty("behaviorClassCount", behaviorContextEvidence.classCount);
@@ -3411,16 +3414,9 @@ public class AzReflectionRenamer extends GhidraScript {
         if (index == null || index.input == null) {
             return;
         }
-        Map<String, SlotGroup> behaviorRttiSlotGroups =
-            rttiSlotGroups(index.rttiTypes.values(), RTTI_SLOT_NAMES);
+        // Slot functions were named with the serialize helpers; see processRttiNames.
         for (RttiType type : index.rttiTypes.values()) {
-            processRttiType(
-                type,
-                RTTI_SLOT_NAMES,
-                behaviorRttiSlotGroups,
-                functionSeen,
-                aliasSeen,
-                actions);
+            processRttiType(type, actions);
             if (monitor.isCancelled()) {
                 return;
             }
@@ -4670,6 +4666,8 @@ public class AzReflectionRenamer extends GhidraScript {
 
         summary.append("\n\nScanned:");
         summary.append("\n  RTTI helpers: ").append(scan.rttiTypes.size());
+        summary.append("\n  Captured RTTI helpers/type-id getters: ").append(scan.capturedRttiHelpers.size())
+            .append("/").append(scan.capturedTypeIdGetters.size());
         summary.append("\n  Class records: ").append(scan.classData.size());
         summary.append("\n  Element callbacks: ").append(elementCallbackCount(scan.classData));
         summary.append("\n  Ambiguous source type names: ").append(scan.collidingTypeNames.size());
@@ -5203,7 +5201,111 @@ public class AzReflectionRenamer extends GhidraScript {
         result.unresolvedCollidingTypeNames = unresolvedCollisions.names;
         result.unresolvedCollidingTypeIdsByName = unresolvedCollisions.typeIdsByName;
         result.typeEvidence = typeEvidence;
+        collectCapturedRtti(root.getAsJsonObject(), objects, classData, result);
         return result;
+    }
+
+    /**
+     * RTTI helpers and type-id getters the dump located. Each azRtti/rttiOnly hierarchy entry names the
+     * helper and AzTypeInfo<T>::Uuid getter its id came from, rttiOnly records give AZ_RTTI blocks with
+     * their slots, and sharedTypeIds lists the types whose UUIDs collide in the binary.
+     */
+    private void collectCapturedRtti(
+        JsonObject root,
+        List<JsonObject> objects,
+        List<ClassData> classData,
+        ScanResult result) {
+
+        result.capturedRttiHelpers = new LinkedHashMap<>();
+        result.capturedTypeIdGetters = new LinkedHashMap<>();
+        capturedRttiTypeIdsByName = new HashMap<>();
+        for (JsonObject object : objects) {
+            JsonArray hierarchy = arrayMember(object, "hierarchy");
+            for (JsonElement value : hierarchy == null ? new JsonArray() : hierarchy) {
+                JsonObject entry = resolveObject(value, jsonObjectsById);
+                if (entry != null) {
+                    rememberCapturedRtti(result, entry, stringMember(entry, "helper"), stringMember(entry, "typeId"));
+                }
+            }
+            if (stringMember(object, "enumHierarchy") != null && stringMember(object, "vtable") != null) {
+                CapturedRttiHelper helper = new CapturedRttiHelper();
+                helper.address = stringMember(object, "vtable");
+                helper.typeId = stringMember(object, "typeId");
+                helper.typeName = stringMember(object, "typeName");
+                helper.getTypeSlot = stringMember(object, "getType");
+                helper.getTypeName = stringMember(object, "getTypeName");
+                helper.enumTypesSlot = stringMember(object, "enumHierarchy");
+                rememberCapturedRttiHelper(result, helper);
+            }
+        }
+        JsonArray shared = arrayMember(root, "sharedTypeIds");
+        for (JsonElement value : shared == null ? new JsonArray() : shared) {
+            JsonObject record = resolveObject(value, jsonObjectsById);
+            JsonArray types = record == null ? null : arrayMember(record, "types");
+            for (JsonElement typeValue : types == null ? new JsonArray() : types) {
+                JsonObject type = resolveObject(typeValue, jsonObjectsById);
+                if (type != null) {
+                    rememberCapturedRtti(result, type, stringMember(type, "helper"), stringMember(record, "typeId"));
+                }
+            }
+        }
+        for (ClassData data : classData) {
+            rememberCapturedRttiTypeName(data.typeName, data.typeId);
+        }
+    }
+
+    private void rememberCapturedRtti(ScanResult result, JsonObject entry, String helperAddress, String typeId) {
+        String typeName = stringMember(entry, "typeName");
+        CapturedRttiHelper helper = new CapturedRttiHelper();
+        helper.address = helperAddress;
+        helper.typeId = typeId;
+        helper.typeName = typeName;
+        helper.getter = stringMember(entry, "getType");
+        helper.getTypeName = stringMember(entry, "getTypeName");
+        rememberCapturedRttiHelper(result, helper);
+
+        String getterAddress = stringMember(entry, "getType");
+        if (!isAddressLike(getterAddress) || typeName == null) return;
+        rememberCapturedRttiTypeName(typeName, typeId);
+        CapturedTypeIdGetter getter = new CapturedTypeIdGetter();
+        getter.address = getterAddress;
+        getter.typeId = typeId;
+        getter.typeName = typeName;
+        CapturedTypeIdGetter existing = result.capturedTypeIdGetters.putIfAbsent(addressKey(getterAddress), getter);
+        if (existing != null && !sameCapturedType(existing.typeId, existing.typeName, typeId, typeName)) {
+            existing.conflicting = true;
+        }
+    }
+
+    private void rememberCapturedRttiHelper(ScanResult result, CapturedRttiHelper helper) {
+        if (!isAddressLike(helper.address) || helper.typeName == null) return;
+        rememberCapturedRttiTypeName(helper.typeName, helper.typeId);
+        CapturedRttiHelper existing = result.capturedRttiHelpers.putIfAbsent(addressKey(helper.address), helper);
+        if (existing == null) return;
+        existing.conflicting |= !sameCapturedType(existing.typeId, existing.typeName, helper.typeId, helper.typeName);
+        existing.getter = mergedCaptureAddress(existing, existing.getter, helper.getter);
+        existing.getTypeName = mergedCaptureAddress(existing, existing.getTypeName, helper.getTypeName);
+        existing.getTypeSlot = mergedCaptureAddress(existing, existing.getTypeSlot, helper.getTypeSlot);
+        existing.enumTypesSlot = mergedCaptureAddress(existing, existing.enumTypesSlot, helper.enumTypesSlot);
+    }
+
+    private String mergedCaptureAddress(CapturedRttiHelper existing, String current, String value) {
+        if (current == null) return value;
+        if (value != null && !addressKey(current).equals(addressKey(value))) existing.conflicting = true;
+        return current;
+    }
+
+    private boolean sameCapturedType(String typeId, String typeName, String otherTypeId, String otherTypeName) {
+        return Objects.equals(normalizeTypeId(typeId), normalizeTypeId(otherTypeId)) &&
+            Objects.equals(typeName, otherTypeName);
+    }
+
+    private void rememberCapturedRttiTypeName(String typeName, String typeId) {
+        String name = serializedTypeName(typeName);
+        String id = normalizeTypeId(typeId);
+        if (name != null && id != null) {
+            capturedRttiTypeIdsByName.computeIfAbsent(name, ignored -> new LinkedHashSet<>()).add(id);
+        }
     }
 
     private void appendAdditionalReflectionTypes(List<ClassData> classData, Map<String, String> names) {
@@ -6781,14 +6883,7 @@ public class AzReflectionRenamer extends GhidraScript {
         }
     }
 
-    private void processRttiType(
-        RttiType type,
-        String[] slotNames,
-        Map<String, SlotGroup> rttiSlotGroups,
-        Set<String> functionSeen,
-        Set<String> aliasSeen,
-        ActionSink actions) throws Exception {
-
+    private void processRttiType(RttiType type, ActionSink actions) throws Exception {
         if (type.targetTypeName == null) {
             addSkipped(actions, "rtti_helper", type.address, null, "missing-type-name");
             return;
@@ -6796,69 +6891,399 @@ public class AzReflectionRenamer extends GhidraScript {
 
         List<String> scope = rttiScope(type);
         renameLabel(type.address, scope, "s_instance", "rtti_helper", actions);
-        Address helperAddress = parseCaptureAddress(type.address);
-        Address vtableAddress = readPointer(helperAddress);
+        Address vtableAddress = readPointer(parseCaptureAddress(type.address));
         if (vtableAddress == null) {
             addSkipped(actions, "label", type.address, fullName(scope, "vftable"), "missing-vtable");
             return;
         }
-
         renameLabel(formatAddress(vtableAddress), scope, "vftable", "rtti_vftable", actions);
-        for (int slot = 0; slot < slotNames.length; slot++) {
-            Address slotPointer = readPointer(vtableAddress.add(slot * 8L));
-            if (slotPointer == null) {
+    }
+
+    /**
+     * Names every RTTI function the captures locate: RttiHelper<T> vftables, AZ_RTTI blocks in class
+     * vtables and AzTypeInfo<T>::Uuid getters. The linker folds identical bodies across these, so all
+     * names are planned before any is applied and a folded body keeps one primary name plus aliases.
+     */
+    private void processRttiNames(ScanResult scan, Set<String> functionSeen, ActionSink actions) throws Exception {
+        RttiNamePlan plan = new RttiNamePlan();
+        ArrayList<CapturedRttiHelper> helperVtables = new ArrayList<>();
+        for (CapturedRttiHelper helper : scan.capturedRttiHelpers.values()) {
+            monitor.checkCancelled();
+            Address table = parseCaptureAddress(helper.address);
+            CapturedRttiHelperKind kind = helper.conflicting ? null : capturedRttiHelperKind(helper, table);
+            if (kind == null) {
+                addSkipped(actions, "rtti_captured_helper", helper.address, helper.typeName,
+                    helper.conflicting ? "conflicting-capture-types" : "capture-does-not-match-binary");
+            }
+            else if (kind == CapturedRttiHelperKind.CLASS_BLOCK) {
+                planCapturedRttiBlock(plan, helper, table, actions);
+            }
+            else {
+                helperVtables.add(helper);
+            }
+        }
+        ArrayList<RttiType> helperTypes = new ArrayList<>(scan.rttiTypes.values());
+        if (behaviorContextEvidence != null) helperTypes.addAll(behaviorContextEvidence.rttiTypes.values());
+        Set<String> helperInstances = new HashSet<>();
+        for (RttiType type : helperTypes) {
+            if (type.targetTypeName == null || !helperInstances.add(addressKey(type.address))) continue;
+            Address vtable = readPointer(parseCaptureAddress(type.address));
+            if (vtable != null) {
+                plan.helperVtables.add(vtable.toString());
+                planRttiHelperSlots(plan, vtable, rttiScope(type), rttiTypeKey(type.typeId, type.targetTypeName), null);
+            }
+        }
+        for (CapturedRttiHelper helper : helperVtables) {
+            Address vtable = parseCaptureAddress(helper.address);
+            if (!plan.helperVtables.add(vtable.toString())) continue;
+            List<String> scope = List.of("AZ", "Internal",
+                "RttiHelper<" + capturedRttiQualifiedName(helper.typeId, helper.typeName) + ">");
+            renameLabel(helper.address, scope, "vftable", "rtti_vftable", actions);
+            planRttiHelperSlots(plan, vtable, scope, rttiTypeKey(helper.typeId, helper.typeName),
+                inferredStaticRttiScope(helper.typeName));
+        }
+        for (CapturedTypeIdGetter getter : scan.capturedTypeIdGetters.values()) {
+            monitor.checkCancelled();
+            Address address = parseCaptureAddress(getter.address);
+            if (getter.conflicting || !isExecutableAddress(address)) {
+                addSkipped(actions, "rtti_type_id_getter", getter.address, getter.typeName,
+                    getter.conflicting ? "conflicting-capture-types" : "getter-not-code");
                 continue;
             }
-            String slotAddress = formatAddress(slotPointer);
-            renameFunction(
-                slotAddress,
-                scope,
-                slotNames[slot],
-                rttiSlotGroups,
-                functionSeen,
-                aliasSeen,
-                actions);
+            List<String> scope = List.of("AZ",
+                "AzTypeInfo<" + capturedRttiQualifiedName(getter.typeId, getter.typeName) + ">");
+            addRttiTarget(plan, address, "rtti_type_id_getter", scope, "Uuid",
+                rttiTypeKey(getter.typeId, getter.typeName), inferredStaticRttiScope(getter.typeName));
         }
+        capturedRttiBlocks.addAll(plan.classBlocks);
+        applyRttiNamePlan(plan, functionSeen, actions);
+    }
+
+    private void planCapturedRttiBlock(
+        RttiNamePlan plan,
+        CapturedRttiHelper helper,
+        Address table,
+        ActionSink actions) throws Exception {
+
+        List<String> scope = capturedRttiTypeScope(helper.typeId, helper.typeName);
+        if (scope == null) {
+            addSkipped(actions, "rtti_class_block", helper.address, helper.typeName, "unparsed-type-name");
+            return;
+        }
+        plan.classBlocks.add(table.toString());
+        if (isCodeReferencedVtable(table)) {
+            renameLabel(helper.address, scope, "vftable", "rtti_class_vftable", actions);
+        }
+        removeLegacyRttiBlockVtableLabel(table, inferredStaticRttiScope(helper.typeName), actions);
+        planAzRttiBlockSlots(plan, table, scope, rttiTypeKey(helper.typeId, helper.typeName),
+            inferredStaticRttiScope(helper.typeName));
+    }
+
+    private void planRttiHelperSlots(
+        RttiNamePlan plan,
+        Address vtable,
+        List<String> scope,
+        String typeKey,
+        List<String> legacyScope) {
+
+        for (int slot = 0; slot < RTTI_SLOT_NAMES.length; slot++) {
+            Address slotPointer = readPointer(vtable.add(slot * 8L));
+            if (isProgramAddress(slotPointer)) {
+                addRttiTarget(plan, slotPointer, "rtti_helper_function", scope, RTTI_SLOT_NAMES[slot], typeKey, legacyScope);
+            }
+        }
+    }
+
+    private void planAzRttiBlockSlots(
+        RttiNamePlan plan,
+        Address table,
+        List<String> scope,
+        String typeKey,
+        List<String> legacyScope) {
+
+        for (int slot = 0; slot < AZ_RTTI_INSTANCE_SLOT_NAMES.length; slot++) {
+            Address slotPointer = readPointer(table.add(slot * 8L));
+            if (isProgramAddress(slotPointer)) {
+                addRttiTarget(plan, slotPointer, "rtti_class_function", scope, AZ_RTTI_INSTANCE_SLOT_NAMES[slot],
+                    typeKey, legacyScope);
+            }
+        }
+    }
+
+    private void addRttiTarget(
+        RttiNamePlan plan,
+        Address address,
+        String kind,
+        List<String> scope,
+        String localName,
+        String typeKey,
+        List<String> legacyScope) {
+
+        plan.functions.computeIfAbsent(formatAddress(address), ignored -> new LinkedHashMap<>())
+            .putIfAbsent(fullName(scope, localName),
+                new RttiFunctionTarget(kind, scope, localName, typeKey, legacyScope));
+    }
+
+    private String rttiTypeKey(String typeId, String typeName) {
+        String id = normalizeTypeId(typeId);
+        return id != null ? id : "name:" + typeName;
+    }
+
+    /**
+     * The capture records a helper by its address; the binary decides which helper it is. An AZ_RTTI block
+     * (RTTI_GetType, RTTI_GetTypeName, RTTI_IsTypeOf, RTTI_EnumTypes, RTTI_AddressOf x2) folds both
+     * AddressOf overloads into one body. An RttiHelper<T> vftable has nine slots, GetActualTypeName at 2 and
+     * GetTypeId at 5. Either is the captured type's when its GetType slot reaches the captured getter or its
+     * name slot is the captured GetTypeName: some types have two AzTypeInfo<T>::Uuid copies over one static
+     * (LinearSpline, NewWorld+0xcfc840 and NewWorld+0x147c0f0), and the capture names only one.
+     */
+    private CapturedRttiHelperKind capturedRttiHelperKind(CapturedRttiHelper helper, Address table) {
+        Address getter = helper.getter != null ? parseCaptureAddress(helper.getter)
+            : rttiGetterTarget(parseCaptureAddress(helper.getTypeSlot));
+        if (!isProgramAddress(table)) return null;
+        Address[] slots = executableSlots(table, AZ_RTTI_INSTANCE_SLOT_NAMES.length);
+        if (slots != null && slots[4].equals(slots[5]) && identifiesCapturedType(helper, getter, slots, 0, 1) &&
+            slotMatches(slots, 0, helper.getTypeSlot) && slotMatches(slots, 3, helper.enumTypesSlot)) {
+            return CapturedRttiHelperKind.CLASS_BLOCK;
+        }
+        slots = executableSlots(table, RTTI_SLOT_NAMES.length);
+        if (helper.getTypeSlot == null && slots != null && identifiesCapturedType(helper, getter, slots, 5, 2)) {
+            return CapturedRttiHelperKind.HELPER_VTABLE;
+        }
+        return null;
+    }
+
+    private boolean identifiesCapturedType(
+        CapturedRttiHelper helper,
+        Address getter,
+        Address[] slots,
+        int typeSlot,
+        int nameSlot) {
+
+        if (!slotMatches(slots, nameSlot, helper.getTypeName)) return false;
+        return helper.getTypeName != null || (getter != null && getter.equals(rttiGetterTarget(slots[typeSlot])));
+    }
+
+    /** GetType slots are `jmp AzTypeInfo<T>::Uuid`; decode the jump where analysis has not reached it. */
+    private Address rttiGetterTarget(Address slot) {
+        Address target = resolvedThunkTarget(slot);
+        if (target == null || !target.equals(slot)) return target;
+        try {
+            if (unsignedByte(slot, 0) == 0xe9) return absoluteAddress(slot.getOffset() + 5L + int32(slot, 1));
+        }
+        catch (Exception ignored) {
+            return target;
+        }
+        return target;
+    }
+
+    private Address[] executableSlots(Address table, int count) {
+        Address[] slots = new Address[count];
+        for (int slot = 0; slot < count; slot++) {
+            slots[slot] = readPointer(table.add(slot * 8L));
+            if (!isExecutableAddress(slots[slot])) {
+                increment(rejectedCodePointers, slots[slot] == null ? "null" :
+                    isProgramAddress(slots[slot]) ? "non-executable" : "unmapped");
+                return null;
+            }
+        }
+        return slots;
+    }
+
+    private boolean slotMatches(Address[] slots, int slot, String expected) {
+        return expected == null || slots[slot].equals(parseCaptureAddress(expected));
+    }
+
+    private boolean isCodeReferencedVtable(Address table) {
+        ReferenceIterator references = currentProgram.getReferenceManager().getReferencesTo(table);
+        while (references.hasNext()) {
+            if (isExecutableAddress(references.next().getFromAddress())) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Class scope for a captured RTTI name. Distinct types the binary names alike keep that name at their
+     * own addresses, as other symbols do; only datatypes need UUID categories.
+     */
+    private List<String> capturedRttiTypeScope(String typeId, String typeName) {
+        if (capturedRttiClassBody(typeId, typeName) != null) {
+            return reflectedTypeScope(typeId, typeName);
+        }
+        List<String> parts = cppScopeParts(typeName);
+        return parts.isEmpty() ? null : parts;
+    }
+
+    private String capturedRttiQualifiedName(String typeId, String typeName) {
+        ClassData body = capturedRttiClassBody(typeId, typeName);
+        return body != null ? body.targetTypeName : String.join("::", cppScopeParts(typeName));
+    }
+
+    /** The serialized class with this UUID, unless the binary gives the UUID to another type too. */
+    private ClassData capturedRttiClassBody(String typeId, String typeName) {
+        String id = normalizeTypeId(typeId);
+        ClassData body = typeEvidence == null || id == null ? null : typeEvidence.classBodiesByTypeId.get(id);
+        String name = serializedTypeName(typeName);
+        if (body == null || body.targetTypeName == null || name == null) return null;
+        return body.targetTypeName.equals(name) || body.targetTypeName.endsWith("::" + name) ? body : null;
+    }
+
+    private void applyRttiNamePlan(RttiNamePlan plan, Set<String> functionSeen, ActionSink actions) throws Exception {
+        monitor.initialize(plan.functions.size());
+        for (Map.Entry<String, LinkedHashMap<String, RttiFunctionTarget>> entry : plan.functions.entrySet()) {
+            monitor.checkCancelled();
+            applyRttiFunctionTargets(parseCaptureAddress(entry.getKey()),
+                new ArrayList<>(entry.getValue().values()), functionSeen, actions);
+            monitor.incrementProgress(1);
+        }
+    }
+
+    /**
+     * The function's primary name becomes the first target when every target names one type, or when its
+     * current name is an RTTI name this import gave it earlier. Names of a body folded across several types
+     * otherwise stay aliases, as for any shared slot function.
+     */
+    private void applyRttiFunctionTargets(
+        Address address,
+        List<RttiFunctionTarget> targets,
+        Set<String> functionSeen,
+        ActionSink actions) throws Exception {
+
+        String jsonAddress = formatAddress(address);
+        boolean claimed = !functionSeen.add(addressKey(jsonAddress));
+        Function function = currentProgram.getFunctionManager().getFunctionAt(address);
+        JsonObject created = new JsonObject();
+        if (function == null && applyRenames) {
+            function = createMissingFunction(address, targets.get(0).localName, created);
+        }
+        RttiFunctionTarget primary = null;
+        for (RttiFunctionTarget target : targets) {
+            if (function != null && functionHasTargetName(function, target.scope, target.localName)) primary = target;
+        }
+        boolean oneType = targets.stream().map(target -> target.typeKey).distinct().count() == 1;
+        if (primary == null && !claimed &&
+            (oneType || (function != null && isStaleRttiName(function.getSymbol(), targets)))) {
+            primary = targets.get(0);
+        }
+        ArrayList<RttiFunctionTarget> ordered = new ArrayList<>(targets);
+        if (primary != null) {
+            ordered.remove(primary);
+            ordered.add(0, primary);
+        }
+        for (RttiFunctionTarget target : ordered) {
+            String targetName = fullName(target.scope, target.localName);
+            JsonObject action = new JsonObject();
+            action.addProperty("kind", target.kind);
+            action.addProperty("address", jsonAddress);
+            action.addProperty("name", targetName);
+            action.addProperty("shared", targets.size() > 1);
+            action.addProperty("useCount", targets.size());
+            action.addProperty("primary", target == primary);
+            recordTargetNameAddress(targetName, jsonAddress, action);
+            if (function == null) {
+                action.addProperty("applied", false);
+                action.addProperty("wouldApply", true);
+                action.addProperty("reason", applyRenames ? "function-create-failed" : "function-missing");
+                actions.add(action);
+                continue;
+            }
+            if (actions.keepsFullActions()) {
+                actions.captureOldNames(address, action);
+            }
+            boolean current = target == primary && functionHasTargetName(function, target.scope, target.localName);
+            boolean applied = false;
+            if (applyRenames && !current) {
+                applied = target == primary ? applyFunctionRename(function, target.scope, target.localName, action)
+                    : ensureLabel(address, target.scope, target.localName, action);
+            }
+            else if (!applyRenames && !current) {
+                action.addProperty("wouldApply", true);
+                action.addProperty("reason", "dry-run");
+            }
+            action.addProperty("applied", applied);
+            actions.add(action);
+        }
+        if (function != null) {
+            removeStaleRttiLabels(address, targets, actions);
+        }
+    }
+
+    /** An RTTI slot name in one of the targets' type scopes that no target asks for. */
+    private boolean isStaleRttiName(Symbol symbol, List<RttiFunctionTarget> targets) {
+        if (symbol.getSource() != SourceType.USER_DEFINED || !GENERATED_RTTI_NAMES.contains(symbol.getName())) {
+            return false;
+        }
+        String scope = scopeKey(namespaceScope(symbol.getParentNamespace()));
+        boolean typeScope = false;
+        for (RttiFunctionTarget target : targets) {
+            String targetScope = scopeKey(target.scope);
+            if (targetScope.equals(scope) && target.localName.equals(symbol.getName())) return false;
+            typeScope |= targetScope.equals(scope) ||
+                (target.legacyScope != null && scopeKey(target.legacyScope).equals(scope));
+        }
+        return typeScope;
+    }
+
+    private void removeStaleRttiLabels(Address address, List<RttiFunctionTarget> targets, ActionSink actions) {
+        for (Symbol symbol : symbols.getSymbols(address)) {
+            if (symbol.getSymbolType() != SymbolType.LABEL || !isStaleRttiName(symbol, targets)) continue;
+            removeStaleRttiSymbol(symbol, "stale_rtti_name", actions);
+        }
+    }
+
+    /** The earlier importer labelled AZ_RTTI blocks as RttiHelper<T>::vftable. */
+    private void removeLegacyRttiBlockVtableLabel(Address table, List<String> legacyScope, ActionSink actions) {
+        for (Symbol symbol : symbols.getSymbols(table)) {
+            if (symbol.getSymbolType() == SymbolType.LABEL && symbol.getSource() == SourceType.USER_DEFINED &&
+                symbol.getName().equals("vftable") &&
+                scopeKey(namespaceScope(symbol.getParentNamespace())).equals(scopeKey(legacyScope))) {
+                removeStaleRttiSymbol(symbol, "stale_rtti_vftable", actions);
+            }
+        }
+    }
+
+    private void removeStaleRttiSymbol(Symbol symbol, String kind, ActionSink actions) {
+        JsonObject action = new JsonObject();
+        action.addProperty("kind", kind);
+        action.addProperty("address", formatAddress(symbol.getAddress()));
+        action.addProperty("name", symbol.getName(true));
+        boolean applied = applyRenames && symbol.delete();
+        if (!applyRenames) {
+            action.addProperty("wouldApply", true);
+            action.addProperty("reason", "dry-run");
+        }
+        action.addProperty("applied", applied);
+        actions.add(action);
     }
 
     private void processInferredStaticRttiHelperVtables(
         Set<String> functionSeen,
-        Set<String> aliasSeen,
         ActionSink actions) throws Exception {
 
-        ArrayList<InferredStaticRttiHelper> helpers = inferredStaticRttiHelpers();
-        if (helpers.isEmpty()) {
-            return;
-        }
-
-        Map<String, SlotGroup> groups =
-            inferredStaticRttiSlotGroups(helpers, INFERRED_STATIC_RTTI_SLOT_NAMES);
-        for (InferredStaticRttiHelper helper : helpers) {
-            List<String> scope = inferredStaticRttiScope(helper.typeName);
-            renameLabel(
-                formatAddress(helper.vtableAddress),
-                scope,
-                "vftable",
-                "inferred_static_rtti_vftable",
-                actions);
-
-            for (int slot = 0; slot < INFERRED_STATIC_RTTI_SLOT_NAMES.length; slot++) {
-                Address slotPointer = readPointer(helper.vtableAddress.add(slot * 8L));
-                Address bodyAddress = resolvedThunkTarget(slotPointer);
-                if (!isProgramAddress(bodyAddress) || !isExecutableAddress(bodyAddress)) {
-                    continue;
-                }
-                renameFunction(
-                    "inferred_static_rtti_function",
-                    formatAddress(bodyAddress),
-                    scope,
-                    INFERRED_STATIC_RTTI_SLOT_NAMES[slot],
-                    groups,
-                    functionSeen,
-                    aliasSeen,
-                    actions);
+        RttiNamePlan plan = new RttiNamePlan();
+        for (InferredStaticRttiHelper helper : inferredStaticRttiHelpers()) {
+            if (capturedRttiBlocks.contains(helper.vtableAddress.toString())) continue;
+            String jsonAddress = formatAddress(helper.vtableAddress);
+            List<String> scope = inferredRttiTypeScope(helper.typeName);
+            if (scope == null) {
+                addSkipped(actions, "inferred_rtti_block", jsonAddress, helper.typeName, "unparsed-type-name");
+                continue;
             }
+            if (isCodeReferencedVtable(helper.vtableAddress)) {
+                renameLabel(jsonAddress, scope, "vftable", "inferred_rtti_vftable", actions);
+            }
+            List<String> legacyScope = inferredStaticRttiScope(helper.typeName);
+            removeLegacyRttiBlockVtableLabel(helper.vtableAddress, legacyScope, actions);
+            planAzRttiBlockSlots(plan, helper.vtableAddress, scope, "name:" + String.join("::", scope), legacyScope);
         }
+        applyRttiNamePlan(plan, functionSeen, actions);
+    }
+
+    /** A string-scanned name joins its serialized class when the captures give the name one UUID. */
+    private List<String> inferredRttiTypeScope(String typeName) {
+        Set<String> ids = capturedRttiTypeIdsByName.get(serializedTypeName(typeName));
+        String typeId = ids != null && ids.size() == 1 ? ids.iterator().next() : null;
+        return capturedRttiTypeScope(typeId, typeName);
     }
 
     private ArrayList<InferredStaticRttiHelper> inferredStaticRttiHelpers() throws CancelledException {
@@ -6913,29 +7338,18 @@ public class AzReflectionRenamer extends GhidraScript {
         return null;
     }
 
+    /** An AZ_RTTI block whose RTTI_GetTypeName returns the string right after it; AddressOf overloads fold. */
     private boolean isInferredStaticRttiHelperVtable(
         Address vtableAddress,
         Address typeNameAddress) {
 
         if (!isProgramAddress(vtableAddress) || !isProgramAddress(typeNameAddress)) return false;
-        Address getTypeName = readPointer(vtableAddress.add(8));
-        if (!isExecutableAddress(getTypeName)) {
+        Address[] slots = executableSlots(vtableAddress, AZ_RTTI_INSTANCE_SLOT_NAMES.length);
+        if (slots == null || !slots[4].equals(slots[5])) {
             return false;
         }
-        Address returnedString = stringAddressReturnedBySimpleFunction(getTypeName);
-        if (returnedString == null || !returnedString.equals(typeNameAddress)) {
-            return false;
-        }
-
-        int executableSlots = 0;
-        for (int slot = 0; slot < INFERRED_STATIC_RTTI_SLOT_NAMES.length; slot++) {
-            Address slotPointer = readPointer(vtableAddress.add(slot * 8L));
-            Address bodyAddress = resolvedThunkTarget(slotPointer);
-            if (isExecutableAddress(bodyAddress)) {
-                executableSlots++;
-            }
-        }
-        return executableSlots >= 4;
+        Address returnedString = stringAddressReturnedBySimpleFunction(slots[1]);
+        return returnedString != null && returnedString.equals(typeNameAddress);
     }
 
     private boolean isPlausibleRttiTypeName(String value) {
@@ -6948,37 +7362,12 @@ public class AzReflectionRenamer extends GhidraScript {
         return value.indexOf(' ') < 0 || value.indexOf('<') >= 0;
     }
 
+    /** RttiHelper<T> scope the pre-capture importer gave string-scanned AZ_RTTI blocks. */
     private List<String> inferredStaticRttiScope(String typeName) {
         ArrayList<String> result = new ArrayList<>();
         result.add("AZ");
         result.add("Internal");
-        result.add("RttiHelper<" + typeName + ">");
-        return result;
-    }
-
-    private Map<String, SlotGroup> inferredStaticRttiSlotGroups(
-        List<InferredStaticRttiHelper> helpers,
-        String[] slotNames) {
-
-        Map<String, SlotGroup> result = new HashMap<>();
-        for (InferredStaticRttiHelper helper : helpers) {
-            for (int slot = 0; slot < slotNames.length; slot++) {
-                Address slotPointer = readPointer(helper.vtableAddress.add(slot * 8L));
-                Address bodyAddress = resolvedThunkTarget(slotPointer);
-                if (!isProgramAddress(bodyAddress)) {
-                    continue;
-                }
-                String address = formatAddress(bodyAddress);
-                String key = addressKey(address);
-                SlotGroup group = result.get(key);
-                if (group == null) {
-                    group = new SlotGroup(address);
-                    result.put(key, group);
-                }
-                group.slotNames.add(slotNames[slot]);
-                group.useCount++;
-            }
-        }
+        result.add("RttiHelper<" + safeTypeName(typeName) + ">");
         return result;
     }
 
@@ -11341,27 +11730,6 @@ public class AzReflectionRenamer extends GhidraScript {
         return failure;
     }
 
-    private Map<String, SlotGroup> rttiSlotGroups(Iterable<RttiType> types, String[] slotNames) {
-        Map<String, SlotGroup> groups = new HashMap<>();
-        for (RttiType type : types) {
-            Address helperAddress = parseCaptureAddress(type.address);
-            Address vtableAddress = readPointer(helperAddress);
-            if (vtableAddress == null) {
-                continue;
-            }
-            for (int slot = 0; slot < slotNames.length; slot++) {
-                Address slotPointer = readPointer(vtableAddress.add(slot * 8L));
-                if (slotPointer == null || !isProgramAddress(slotPointer)) {
-                    continue;
-                }
-                SlotGroup group = groupFor(groups, formatAddress(slotPointer));
-                group.slotNames.add(slotNames[slot]);
-                group.useCount++;
-            }
-        }
-        return groups;
-    }
-
     private Map<String, SlotGroup> callbackGroups(List<ClassData> classData) {
         Map<String, SlotGroup> groups = new HashMap<>();
         for (ClassData data : classData) {
@@ -13575,6 +13943,56 @@ public class AzReflectionRenamer extends GhidraScript {
         LinkedHashSet<String> unresolvedCollidingTypeNames;
         LinkedHashMap<String, LinkedHashSet<String>> unresolvedCollidingTypeIdsByName;
         TypeEvidenceIndex typeEvidence;
+        LinkedHashMap<String, CapturedRttiHelper> capturedRttiHelpers;
+        LinkedHashMap<String, CapturedTypeIdGetter> capturedTypeIdGetters;
+    }
+
+    /** A helper the dump located: an AZ_RTTI block in a class vtable or an RttiHelper<T> vftable. */
+    private static class CapturedRttiHelper {
+        String address;
+        String typeId;
+        String typeName;
+        /** AzTypeInfo<T>::Uuid, which the helper's GetType slot reaches. */
+        String getter;
+        /** Block slot 1 (RTTI_GetTypeName) or RttiHelper slot 2 (GetActualTypeName). */
+        String getTypeName;
+        /** rttiOnly gives an AZ_RTTI block's RTTI_GetType and RTTI_EnumTypes slots directly. */
+        String getTypeSlot;
+        String enumTypesSlot;
+        boolean conflicting;
+    }
+
+    private enum CapturedRttiHelperKind { CLASS_BLOCK, HELPER_VTABLE }
+
+    private static class CapturedTypeIdGetter {
+        String address;
+        String typeId;
+        String typeName;
+        boolean conflicting;
+    }
+
+    /** Every RTTI name planned for each function, keyed by address. */
+    private static class RttiNamePlan {
+        final LinkedHashMap<String, LinkedHashMap<String, RttiFunctionTarget>> functions = new LinkedHashMap<>();
+        final Set<String> classBlocks = new HashSet<>();
+        final Set<String> helperVtables = new HashSet<>();
+    }
+
+    private static class RttiFunctionTarget {
+        final String kind;
+        final List<String> scope;
+        final String localName;
+        final String typeKey;
+        /** RttiHelper<T> scope earlier imports used for this type; RTTI names left there are stale. */
+        final List<String> legacyScope;
+
+        RttiFunctionTarget(String kind, List<String> scope, String localName, String typeKey, List<String> legacyScope) {
+            this.kind = kind;
+            this.scope = scope;
+            this.localName = localName;
+            this.typeKey = typeKey;
+            this.legacyScope = legacyScope;
+        }
     }
 
     private static class RttiType {

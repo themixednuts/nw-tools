@@ -79,8 +79,32 @@ phase exceptions and action/field errors, continues through independent validati
 phases, and blocks application if any error was found. Diagnostics retain the
 total error count and up to 100 error samples. Expected unresolved evidence stays
 in action reason counts and samples. Zero, unmapped and non-executable native
-function pointers are skipped before instruction lookup; sparse RTTI tables still
-require enough executable slots and a verified type-name getter.
+function pointers are skipped before instruction lookup. A string-scanned RTTI
+table needs all six AZ_RTTI slots in code, folded `AddressOf` overloads and a
+verified type-name getter.
+
+RTTI functions follow the 3-26 layouts. An `AZ::Internal::RttiHelper<T>` vftable
+has nine slots: `~RttiHelper`, `GetActualUuid`, `GetActualTypeName`, `CastConst`,
+`Cast`, `GetTypeId`, `IsTypeOf`, `IsAbstract` and `EnumHierarchy`. An `AZ_RTTI`
+class has a six-slot block in its own vtable: `GetType`, `GetTypeName`, `IsTypeOf`,
+`EnumTypes` and the folded `AddressOfConst`/`AddressOf`. Serialize and
+BehaviorContext helper instances name their vftables. The serialize capture adds
+every hierarchy entry's helper and `AzTypeInfo<T>::Uuid` getter, `rttiOnly`'s
+blocks for types the SerializeContext does not reflect, and `sharedTypeIds`.
+The binary decides what each captured helper is. A block's `GetType` slot reaches
+the captured getter, or its name slot is the captured `GetTypeName`; some types
+have a second getter copy over the same static `AZ::Uuid`. Captures the binary
+contradicts are skipped as `capture-does-not-match-binary`. A type whose UUID
+belongs to another serialized class (`sharedTypeIds`) keeps its own RTTI name.
+Distinct types with one RTTI name keep it at their own addresses.
+All RTTI names are planned before any is applied, because the linker folds
+bodies across them: `RttiHelper<T>::GetTypeId` is often `T::RTTI_GetType`, and
+one destructor serves every helper. A body named for one type gets that name as
+its primary symbol and the rest as aliases. A body shared by several types keeps
+its primary unless an earlier import gave it a stale RTTI name. Names from the
+earlier six-slot helper mapping and `RttiHelper<T>::vftable` labels on AZ_RTTI
+blocks are removed where the new names replace them. A block gets `T::vftable`
+only when code references it.
 
 Function renames change the symbol name and namespace together through Ghidra's
 atomic API. Existing aliases in the old namespace remain intact. An alias matching
@@ -405,6 +429,10 @@ field offsets, previews, manual layouts, repeated runs and ABI mismatch rejectio
 layouts, by-value and pointer consumers, receiver signatures, migration IDs,
 manual canonical types, report coverage and repeated runs. Its arguments are the
 Ghidra installation directory and a temporary output directory.
+`tests/AzReflectionCapturedRttiTest.java` checks captured RttiHelper vftables,
+AZ_RTTI blocks and getters with folded and shared bodies, stale six-slot names,
+names shared by distinct types, shared UUIDs and a capture the binary
+contradicts, with the same two arguments.
 `tests/AzReflectionRepeatedNamesTest.java` checks repeated native RTTI tables and
 bodies, MB generic functions and namespace repair at separate addresses, with the
 same two arguments.

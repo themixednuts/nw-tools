@@ -26,6 +26,7 @@ import ghidra.program.model.lang.CompilerSpecID;
 import ghidra.program.model.lang.LanguageID;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.util.DefaultLanguageService;
 import ghidra.util.task.TaskMonitor;
@@ -62,15 +63,19 @@ public class AzReflectionValidationTest {
                     "could not decode this-adjust fixture");
                 check(new DisassembleCommand(base.add(0x170), null, true).applyTo(program, TaskMonitor.DUMMY),
                     "could not decode direct-jump fixture");
-                byte[] pointers = ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
+                // AZ_RTTI block (AddressOf overloads folded), then unmapped and null words the scan must reject.
+                byte[] pointers = ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN)
                     .putLong(base.add(0x100).getOffset()).putLong(base.add(0x110).getOffset())
-                    .putLong(0xdeadbeefL).putLong(base.add(0x130).getOffset())
-                    .putLong(base.add(0x140).getOffset()).putLong(0).array();
+                    .putLong(base.add(0x120).getOffset()).putLong(base.add(0x130).getOffset())
+                    .putLong(base.add(0x140).getOffset()).putLong(base.add(0x140).getOffset())
+                    .putLong(0xdeadbeefL).putLong(0).array();
                 program.getMemory().setBytes(table, pointers);
-                String name = "MB::Sparse<Javelin::Key>";
+                program.getReferenceManager().addMemoryReference(base.add(0x180), table, RefType.DATA,
+                    SourceType.IMPORTED, 0);
+                String name = "MB::Block<Javelin::Key>";
                 program.getMemory().setBytes(string, (name + "\0").getBytes(StandardCharsets.US_ASCII));
                 program.getListing().createData(string, TerminatedStringDataType.dataType);
-                for (long offset : new long[]{0x100, 0x110, 0x130, 0x140}) {
+                for (long offset : new long[]{0x100, 0x110, 0x120, 0x130, 0x140}) {
                     Address entry = base.add(offset);
                     program.getFunctionManager().createFunction("FUN_" + Long.toHexString(offset), entry,
                         new AddressSet(entry, entry.add(offset == 0x110 ? 10 : 0)), SourceType.DEFAULT);
@@ -92,7 +97,7 @@ public class AzReflectionValidationTest {
                 "saved dry run lacks native pointer diagnostics");
             check(!Files.exists(resources.resolve("reflection-report.json")), "dry run overwrote the applied report");
             check((boolean) call(preview, "isInferredStaticRttiHelperVtable", table, string),
-                "valid sparse RTTI table was discarded");
+                "valid AZ_RTTI block was discarded");
             for (Address invalid : new Address[]{null, base.add(0x9000), table}) {
                 check(call(preview, "thisAdjustThunk", invalid) == null, "invalid thunk was decoded");
                 check(call(preview, "directJumpTarget", invalid) == null, "invalid jump was decoded");
@@ -108,7 +113,7 @@ public class AzReflectionValidationTest {
             run(script(program), resources);
             check(program.getSymbolTable().getSymbols(table).length > 0, "native inferred RTTI table was not labeled");
             check(diagnostics(resources).get("status").getAsString().equals("passed"), "normal retry did not recover");
-            System.out.println("PASS: actual inferred RTTI scan, zero/unmapped/non-code slots, sparse tables, decoded thunks, " +
+            System.out.println("PASS: actual inferred RTTI scan, zero/unmapped/non-code slots, AZ_RTTI blocks, decoded thunks, " +
                 "saved preview, pre-edit validation failure, apply rollback, cancellation, prior-report preservation and retry");
         }
         finally {

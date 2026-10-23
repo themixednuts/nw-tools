@@ -9,15 +9,16 @@ absolute `0x<heap>` for capture-process objects, which never become labels.
 
 | Section | Contents | Ghidra destination |
 | --- | --- | --- |
-| `uuidMap` (4,362) | Class bodies: `name`, `typeId`, `version`, `factory`/`serializer`/`eventHandler`/`persistentId`/`converter` pointers, `containerInfo` (vtable + slots), `azRtti` (typeName, `hierarchy[]` with `getType`/`helper`/`getTypeName`), `elements[]` | Structures and fields, callback names, container tables, RTTI slot names |
+| `uuidMap` (4,362) | Class bodies: `name`, `typeId`, `version`, `factory`/`serializer`/`eventHandler`/`persistentId`/`converter` pointers, `containerInfo` (vtable + slots), `azRtti` (`address` of the `RttiHelper<T>` instance, typeName, `hierarchy[]`), `elements[]` | Structures and fields, callback names, container tables, `RttiHelper<T>::s_instance`/`vftable` and its nine slot names |
+| `*.hierarchy[]` | `typeId`, `typeName`, `getType` (`AzTypeInfo<T>::Uuid`), `helper` (the type's AZ_RTTI block or `RttiHelper<T>` vftable), `getTypeName` (that helper's name slot) | `AzTypeInfo<T>::Uuid`; `T::GetType`...`AddressOf` for blocks, `RttiHelper<T>` slots for vftables, once the binary confirms the helper |
 | `uuidMap.*.elements[]` | `name`, `typeId`, `offset`/`dataSize` (strings), `is_pointer`, `is_base_class`, nested `genericClassInfo`, `attributes[[id, {attributeName, value}]]` | Typed fields. `memberFunction`/`function` attribute values name callbacks and type `this`. An `EnumType` attribute (`value.kind: "Uuid"`) types the field as that enum. |
 | `uuidGenericMap` (777) | `[typeId, genericClassInfo]` for template specializations | Template names, container element types |
 | `enumTypeIdToUnderlyingTypeIdMap` (132) | Enum UUID → underlying scalar UUID | Enum width and signedness |
 | `editContext.enumData` (326) | `[enumId, {name, attributes:[[id, {attributeName: "EnumValue", value: {valueU64, valueU32, valueHighU32, description}}]]}]` | Enum constants. Words are read past narrow storage, so they are masked to the enum width. `valueU64: null` means zero. |
 | `classNameToUuid` (7,156) | `[nameCrc, typeId]` pairs | Not used |
 | `uuidAnyCreationMap` (5,082) | `typeId` → AnyCreator function | Not used (traces supply `AnyCreator` instead) |
-| `rttiOnly` (3,686) | AZ RTTI types the SerializeContext does not reflect: `typeId`, `typeName`, `hierarchy[]`, `getType`, `getTypeName`, `enumHierarchy`, `vtable` | Not used |
-| `sharedTypeIds` (12) | UUIDs that distinct native types share (`types[]` with `getType`, `staticTypeId`, `helper`) | Not used. UUID-keyed datatypes cannot tell these types apart. |
+| `rttiOnly` (3,686) | AZ RTTI types the SerializeContext does not reflect: `typeId`, `typeName`, `hierarchy[]`, and the AZ_RTTI block at `vtable` with its `getType`, `getTypeName` and `enumHierarchy` slots | The block's six functions, checked slot by slot; `T::vftable` when code references the block |
+| `sharedTypeIds` (12) | UUIDs that distinct native types share (`types[]` with `getType`, `staticTypeId`, `helper`) | Those types' helpers and getters, named by RTTI name rather than by the UUID's class body. UUID-keyed datatypes still cannot tell them apart. |
 
 Serialized enum fields in this capture are always scalars with an `EnumType`
 attribute (257 fields, 241 with enumerators). None use the enum UUID as their

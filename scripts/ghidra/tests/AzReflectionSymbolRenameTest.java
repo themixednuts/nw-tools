@@ -65,15 +65,21 @@ public class AzReflectionSymbolRenameTest {
                 program.getMemory().createInitializedBlock("rtti", table, 0x100, (byte) 0, TaskMonitor.DUMMY, false);
                 program.getMemory().setBytes(base.add(0x110), ByteBuffer.allocate(11).order(ByteOrder.LITTLE_ENDIAN)
                     .put((byte) 0x48).put((byte) 0xb8).putLong(string.getOffset()).put((byte) 0xc3).array());
+                // AZ_RTTI block; the string scan finds it through RTTI_GetTypeName.
                 program.getMemory().setBytes(table, ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
-                    .putLong(entry.getOffset()).putLong(base.add(0x110).getOffset()).putLong(0)
-                    .putLong(base.add(0x130).getOffset()).putLong(base.add(0x140).getOffset()).putLong(0).array());
+                    .putLong(entry.getOffset()).putLong(base.add(0x110).getOffset()).putLong(base.add(0x120).getOffset())
+                    .putLong(base.add(0x130).getOffset()).putLong(base.add(0x140).getOffset())
+                    .putLong(base.add(0x140).getOffset()).array());
                 program.getMemory().setBytes(string, (type + "\0").getBytes(StandardCharsets.US_ASCII));
                 program.getListing().createData(string, TerminatedStringDataType.dataType);
                 if (scenario == Case.LATE_ALIAS) {
+                    // Two RttiHelper instances over one nine-slot vftable; its GetTypeId folds with RTTI_GetType.
                     program.getMemory().setLong(table.add(0x60), table.add(0x80).getOffset());
                     program.getMemory().setLong(table.add(0x68), table.add(0x80).getOffset());
-                    program.getMemory().setLong(table.add(0x80), entry.getOffset());
+                    long[] helperSlots = {0x150, 0x160, 0x170, 0x180, 0x190, 0x100, 0x1a0, 0x1b0, 0x1c0};
+                    for (int slot = 0; slot < helperSlots.length; slot++) {
+                        program.getMemory().setLong(table.add(0x80 + slot * 8L), base.add(helperSlots[slot]).getOffset());
+                    }
                 }
                 var symbols = program.getSymbolTable();
                 Namespace az = symbols.createNameSpace(program.getGlobalNamespace(), "AZ", SourceType.USER_DEFINED);
@@ -92,7 +98,7 @@ public class AzReflectionSymbolRenameTest {
                     scenario == Case.SAME_NAMESPACE || scenario == Case.NAMESPACE_ONLY) {
                     symbols.createLabel(entry, "GetTypeId", target, SourceType.USER_DEFINED);
                 }
-                for (long offset : new long[]{0x110, 0x130, 0x140}) {
+                for (long offset : new long[]{0x110, 0x120, 0x130, 0x140}) {
                     Address body = base.add(offset);
                     program.getFunctionManager().createFunction("FUN_" + Long.toHexString(offset), body,
                         new AddressSet(body, body.add(offset == 0x110 ? 10 : 0)), SourceType.DEFAULT);
@@ -111,8 +117,14 @@ public class AzReflectionSymbolRenameTest {
             check(function.getName(true).equals(oldName) && program.getSymbolTable().getNumSymbols() == symbolCount,
                 "dry run edited existing symbols: " + scenario);
             run(program, resources, false);
-            check(function.getName(true).equals("AZ::Internal::" + targetClass + "::GetTypeId"),
-                "RTTI function kept its previous owner/name: " + scenario);
+            // The block's RTTI_GetType is the class's own function; with the helper it folds, the helper names it.
+            String expected = scenario == Case.LATE_ALIAS ? "AZ::Internal::RttiHelper<CurrentCardData>::GetTypeId" :
+                type + "::GetType";
+            check(function.getName(true).equals(expected),
+                "RTTI function kept its previous owner/name: " + scenario + " " + function.getName(true));
+            check(java.util.Arrays.stream(program.getSymbolTable().getSymbols(entry)).noneMatch(symbol ->
+                symbol.getName(true).startsWith("AZ::Internal::" + targetClass + "::")),
+                "six-slot RttiHelper name left on an AZ_RTTI block: " + scenario);
             check(function.getSymbol().getID() == functionId, "function symbol identity replaced: " + scenario);
             if (sourceAlias != null) {
                 check(program.getSymbolTable().getSymbol(sourceAliasId) != null &&
@@ -124,7 +136,8 @@ public class AzReflectionSymbolRenameTest {
                 check(java.util.Arrays.stream(aliases).anyMatch(symbol -> symbol.getName(true)
                     .equals("AZ::Internal::RttiHelper<CurrentCardData>::GetTypeId")) &&
                     java.util.Arrays.stream(aliases).anyMatch(symbol -> symbol.getName(true)
-                    .equals("AZ::Internal::RttiHelper<OtherCardData>::GetTypeId")),
+                    .equals("AZ::Internal::RttiHelper<OtherCardData>::GetTypeId")) &&
+                    java.util.Arrays.stream(aliases).anyMatch(symbol -> symbol.getName(true).equals(type + "::GetType")),
                     "aliases created earlier in the same import were not retained");
             }
             JsonObject validation = json(resources.resolve("reflection-dry-run.json"));

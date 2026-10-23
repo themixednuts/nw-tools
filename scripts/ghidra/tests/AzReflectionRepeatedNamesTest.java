@@ -52,12 +52,16 @@ public class AzReflectionRepeatedNamesTest {
                     long code = 0x100 + i * 0x80;
                     program.getMemory().setBytes(text, "MB::Same<Javelin::Key>\0".getBytes(StandardCharsets.US_ASCII));
                     program.getListing().createData(text, TerminatedStringDataType.dataType);
+                    // AZ_RTTI block: GetType, GetTypeName, IsTypeOf, EnumTypes and both folded AddressOf overloads.
                     program.getMemory().setBytes(table, ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
-                        .putLong(base.add(code).getOffset()).putLong(base.add(code + 0x10).getOffset()).putLong(0)
-                        .putLong(base.add(code + 0x30).getOffset()).putLong(base.add(code + 0x40).getOffset()).putLong(0).array());
+                        .putLong(base.add(code).getOffset()).putLong(base.add(code + 0x10).getOffset())
+                        .putLong(base.add(code + 0x20).getOffset()).putLong(base.add(code + 0x30).getOffset())
+                        .putLong(base.add(code + 0x40).getOffset()).putLong(base.add(code + 0x40).getOffset()).array());
+                    program.getReferenceManager().addMemoryReference(base.add(code + 0x50), table, RefType.DATA,
+                        SourceType.USER_DEFINED, 0);
                     program.getMemory().setBytes(base.add(code + 0x10), ByteBuffer.allocate(11).order(ByteOrder.LITTLE_ENDIAN)
                         .put((byte) 0x48).put((byte) 0xb8).putLong(text.getOffset()).put((byte) 0xc3).array());
-                    for (long offset : new long[]{code, code + 0x10, code + 0x30, code + 0x40}) {
+                    for (long offset : new long[]{code, code + 0x10, code + 0x20, code + 0x30, code + 0x40}) {
                         Address entry = base.add(offset);
                         program.getFunctionManager().createFunction("FUN_" + offset, entry,
                             new AddressSet(entry, entry.add(offset == code + 0x10 ? 10 : 0)), SourceType.DEFAULT);
@@ -90,10 +94,10 @@ public class AzReflectionRepeatedNamesTest {
             run(program, resources, false);
             for (long offset : new long[]{0x100, 0x180})
                 check(program.getFunctionManager().getFunctionAt(base.add(offset)).getName(true)
-                    .equals("AZ::Internal::RttiHelper<MB::Same<Javelin::Key>>::GetTypeId"), "duplicate RTTI function was skipped");
+                    .equals("MB::Same<Javelin::Key>::GetType"), "duplicate RTTI function was skipped");
             for (long offset : new long[]{0x2000, 0x2200})
                 check(Arrays.stream(program.getSymbolTable().getSymbols(base.add(offset))).anyMatch(symbol ->
-                    symbol.getName(true).equals("AZ::Internal::RttiHelper<MB::Same<Javelin::Key>>::vftable")), "duplicate vtable was skipped");
+                    symbol.getName(true).equals("MB::Same<Javelin::Key>::vftable")), "duplicate vtable was skipped");
             for (long offset : new long[]{0x300, 0x310})
                 check(program.getFunctionManager().getFunctionAt(base.add(offset)).getName(true).equals("MB::GetTypeName<Javelin::Key>"),
                     "duplicate MB generic function was skipped");
