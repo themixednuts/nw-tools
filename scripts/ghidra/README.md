@@ -251,6 +251,9 @@ address. Later actions record newly added names without copying the growing list
 Comments are merged once per address and comment type,
 including shared implementations, adapters and source reflectors. This avoids
 repeated large comment-history diffs while retaining every owner's metadata.
+`BehaviorContext evidence:` lines carry capture-session addresses, so where a run
+writes evidence it replaces the evidence lines an earlier capture left at that
+address; other lines are kept.
 Temporary files are removed after success, cancellation or an input error; the
 final report replaces the previous file only after writing completes.
 

@@ -140,6 +140,11 @@ public class AzReflectionRenamer extends GhidraScript {
     private static final long BEHAVIOR_TRAIT_THIS_PTR = 8;
     private static final String BEHAVIOR_CALLING_CONVENTION = "__fastcall";
     private static final String BEHAVIOR_RESULT_BUFFER_NAME = "result";
+    /**
+     * Comment lines rebuilt from the capture on every run. They carry capture-session addresses, so an address
+     * this run writes one to drops the lines an earlier capture left there.
+     */
+    private static final List<String> REGENERATED_COMMENT_PREFIXES = List.of("BehaviorContext evidence: ");
     /** Candidate kinds whose native function takes exactly the captured signature. */
     private static final Set<String> BEHAVIOR_SIGNATURE_KINDS = Set.of(
         "global.method", "global.property.getter", "global.property.setter", "class.constructor",
@@ -4567,6 +4572,11 @@ public class AzReflectionRenamer extends GhidraScript {
                 pending = new PendingComment(codeUnit.getAddress(), commentType, codeUnit.getComment(commentType));
                 pendingComments.put(key, pending);
             }
+            String prefix = regeneratedCommentPrefix(comment);
+            if (prefix != null) {
+                pending.regeneratedPrefixes.add(prefix);
+                pending.regeneratedLines.add(comment);
+            }
             if (!pending.lines.add(comment)) {
                 action.addProperty("reason", "already-current");
                 return false;
@@ -4593,22 +4603,40 @@ public class AzReflectionRenamer extends GhidraScript {
     private void flushPendingComments() throws CancelledException {
         for (PendingComment pending : pendingComments.values()) {
             monitor.checkCancelled();
-            if (pending.additions.isEmpty()) continue;
+            if (pending.additions.isEmpty() && pending.regeneratedPrefixes.isEmpty()) continue;
             CodeUnit unit = currentProgram.getListing().getCodeUnitAt(pending.address);
             if (unit == null) continue;
             String existing = unit.getComment(pending.type);
             LinkedHashSet<String> lines = new LinkedHashSet<>();
-            if (existing != null) Collections.addAll(lines, existing.split("\\R"));
-            StringBuilder text = new StringBuilder(existing == null ? "" : existing);
+            StringBuilder text = new StringBuilder();
+            if (existing != null) {
+                for (String line : existing.split("\\R")) {
+                    String prefix = regeneratedCommentPrefix(line);
+                    if (prefix != null && pending.regeneratedPrefixes.contains(prefix) &&
+                        !pending.regeneratedLines.contains(line)) {
+                        continue;
+                    }
+                    lines.add(line);
+                    if (text.length() > 0) text.append('\n');
+                    text.append(line);
+                }
+            }
             for (String addition : pending.additions) {
                 if (!lines.add(addition)) continue;
                 if (text.length() > 0) text.append('\n');
                 text.append(addition);
             }
-            String merged = text.toString();
+            String merged = text.length() == 0 ? null : text.toString();
             if (!sameText(existing, merged)) unit.setComment(pending.type, merged);
         }
         pendingComments.clear();
+    }
+
+    private static String regeneratedCommentPrefix(String line) {
+        for (String prefix : REGENERATED_COMMENT_PREFIXES) {
+            if (line.startsWith(prefix)) return prefix;
+        }
+        return null;
     }
 
     private static class PendingComment {
@@ -4616,6 +4644,9 @@ public class AzReflectionRenamer extends GhidraScript {
         final CommentType type;
         final Set<String> lines = new HashSet<>();
         final ArrayList<String> additions = new ArrayList<>();
+        /** Regenerated prefixes written here this run, and the lines that carry them. */
+        final Set<String> regeneratedPrefixes = new HashSet<>();
+        final Set<String> regeneratedLines = new HashSet<>();
 
         PendingComment(Address address, CommentType type, String existing) {
             this.address = address;

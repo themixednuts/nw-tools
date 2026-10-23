@@ -185,6 +185,12 @@ public class AzBehaviorContextTest {
                 new CategoryPath("/AZ/BehaviorContext/Constants"), "Options_32bit").getUniversalID()), "enum identity retained");
             check(beforeComment.equals(program.getListing().getComment(CommentType.PLATE,
                 program.getImageBase().add(0x160))), "rerun does not duplicate metadata comments");
+            String stale = "BehaviorContext evidence: {\"name\":\"Earlier capture\",\"method\":{\"address\":\"0x2022815d200\"}}";
+            program.getListing().setComment(program.getImageBase().add(0x160), CommentType.PLATE,
+                beforeComment + "\n" + stale + "\nAnalyst note");
+            run(program, resources);
+            check((beforeComment + "\nAnalyst note").equals(program.getListing().getComment(CommentType.PLATE,
+                program.getImageBase().add(0x160))), "a new capture replaces stale evidence and keeps other lines");
             System.out.println("PASS: BehaviorContext map-only classes, normalized aliases, shared owners, attributes, EBus variants/IDs/virtual properties, on-demand reflectors, constant enums, manual conflicts, preview and idempotence");
         }
         finally {
