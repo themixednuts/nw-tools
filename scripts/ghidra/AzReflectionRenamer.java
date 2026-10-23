@@ -409,6 +409,7 @@ public class AzReflectionRenamer extends GhidraScript {
         report.addProperty("rttiTypeCount", scan.rttiTypes.size());
         report.addProperty("capturedRttiHelperCount", scan.capturedRttiHelpers.size());
         report.addProperty("capturedTypeIdGetterCount", scan.capturedTypeIdGetters.size());
+        report.addProperty("anyCreatorCount", scan.anyCreators.size());
         report.addProperty("classDataCount", scan.classData.size());
         report.addProperty("elementCallbackCount", elementCallbackCount(scan.classData));
         report.addProperty("moduleDescriptorCount", moduleEvidence.descriptorCount);
@@ -494,8 +495,10 @@ public class AzReflectionRenamer extends GhidraScript {
             for (var entry : result.entrySet()) containerReport.add(entry.getKey(), entry.getValue());
         });
         runReflectionPhase("registration-traces", preview, () -> {
-            processClassRegistrationTraces(classRegistrationFunctionGroups(),
+            Map<String, SlotGroup> registrationGroups = classRegistrationFunctionGroups(scan.anyCreators);
+            processClassRegistrationTraces(registrationGroups,
                 classRegistrationFunctions, functionSeen, aliasSeen, actions);
+            processCapturedAnyCreators(scan, registrationGroups, functionSeen, aliasSeen, actions);
             processFieldRegistrationTraces(functionSeen, actions);
         });
         runReflectionPhase("module-descriptors", preview, () -> processModuleDescriptorRenames(actions));
@@ -593,6 +596,7 @@ public class AzReflectionRenamer extends GhidraScript {
         validationReport.addProperty("rttiTypeCount", scan.rttiTypes.size());
         validationReport.addProperty("capturedRttiHelperCount", scan.capturedRttiHelpers.size());
         validationReport.addProperty("capturedTypeIdGetterCount", scan.capturedTypeIdGetters.size());
+        validationReport.addProperty("anyCreatorCount", scan.anyCreators.size());
         validationReport.addProperty("classDataCount", scan.classData.size());
         validationReport.addProperty("moduleDescriptorCount", moduleEvidence.descriptorCount);
         validationReport.addProperty("behaviorClassCount", behaviorContextEvidence.classCount);
@@ -4668,6 +4672,7 @@ public class AzReflectionRenamer extends GhidraScript {
         summary.append("\n  RTTI helpers: ").append(scan.rttiTypes.size());
         summary.append("\n  Captured RTTI helpers/type-id getters: ").append(scan.capturedRttiHelpers.size())
             .append("/").append(scan.capturedTypeIdGetters.size());
+        summary.append("\n  AnyCreators: ").append(scan.anyCreators.size());
         summary.append("\n  Class records: ").append(scan.classData.size());
         summary.append("\n  Element callbacks: ").append(elementCallbackCount(scan.classData));
         summary.append("\n  Ambiguous source type names: ").append(scan.collidingTypeNames.size());
@@ -4770,6 +4775,7 @@ public class AzReflectionRenamer extends GhidraScript {
         summary.append("\n\nBy kind:");
         appendCount(summary, stats.kindCounts, "function");
         appendCount(summary, stats.kindCounts, "function_alias");
+        appendCount(summary, stats.kindCounts, "any_creator");
         appendCount(summary, stats.kindCounts, "classdata_object");
         appendCount(summary, stats.kindCounts, "classdata_object_vftable");
         appendCount(summary, stats.kindCounts, "rtti_helper");
@@ -5202,6 +5208,20 @@ public class AzReflectionRenamer extends GhidraScript {
         result.unresolvedCollidingTypeIdsByName = unresolvedCollisions.typeIdsByName;
         result.typeEvidence = typeEvidence;
         collectCapturedRtti(root.getAsJsonObject(), objects, classData, result);
+        result.anyCreators = collectAnyCreators(root.getAsJsonObject());
+        return result;
+    }
+
+    /** uuidAnyCreationMap: the CreateAny function SerializeContext::Class<T> registered for each type id. */
+    private LinkedHashMap<String, String> collectAnyCreators(JsonObject root) {
+        LinkedHashMap<String, String> result = new LinkedHashMap<>();
+        JsonObject map = objectMember(root, "uuidAnyCreationMap");
+        if (map == null) return result;
+        for (Map.Entry<String, JsonElement> entry : map.entrySet()) {
+            String typeId = normalizeTypeId(entry.getKey());
+            String address = stringElement(entry.getValue());
+            if (typeId != null && isAddressLike(address)) result.put(typeId, address);
+        }
         return result;
     }
 
@@ -11753,15 +11773,67 @@ public class AzReflectionRenamer extends GhidraScript {
         return groups;
     }
 
-    private Map<String, SlotGroup> classRegistrationFunctionGroups() {
+    private Map<String, SlotGroup> classRegistrationFunctionGroups(Map<String, String> anyCreators) {
         Map<String, SlotGroup> groups = new HashMap<>();
-        if (classRegistrationEvidence == null) {
-            return groups;
+        if (classRegistrationEvidence != null) {
+            for (ClassRegistrationRecord record : classRegistrationEvidence.recordsByTypeId.values()) {
+                rememberClassRegistrationFunction(groups, record.anyCreator, "AnyCreator");
+            }
         }
-        for (ClassRegistrationRecord record : classRegistrationEvidence.recordsByTypeId.values()) {
-            rememberClassRegistrationFunction(groups, record.anyCreator, "AnyCreator");
+        for (Map.Entry<String, String> entry : anyCreators.entrySet()) {
+            if (tracedAnyCreator(entry.getKey()) == null) {
+                rememberClassRegistrationFunction(groups, entry.getValue(), "AnyCreator");
+            }
         }
         return groups;
+    }
+
+    private String tracedAnyCreator(String typeId) {
+        if (classRegistrationEvidence == null) return null;
+        ClassRegistrationRecord record = classRegistrationEvidence.recordsByTypeId.get(typeId);
+        return record != null && isAddressLike(record.anyCreator) ? record.anyCreator : null;
+    }
+
+    /**
+     * Names the uuidAnyCreationMap creators that no registration trace covered. A creator shared by
+     * several types (non-copyable types fold onto one empty-any body) gets an alias per type.
+     */
+    private void processCapturedAnyCreators(
+        ScanResult scan,
+        Map<String, SlotGroup> groups,
+        Set<String> functionSeen,
+        Set<String> aliasSeen,
+        ActionSink actions) throws Exception {
+
+        Map<String, ClassData> bodies = new HashMap<>();
+        for (ClassData data : canonicalClassDataByTypeId(scan.classData)) {
+            bodies.put(normalizeTypeId(data.typeId), data);
+        }
+        for (Map.Entry<String, String> entry : scan.anyCreators.entrySet()) {
+            monitor.checkCancelled();
+            String typeId = entry.getKey();
+            String address = entry.getValue();
+            String traced = tracedAnyCreator(typeId);
+            if (traced != null) {
+                if (!addressKey(traced).equals(addressKey(address))) {
+                    addSkipped(actions, "any_creator", address, typeId, "registration-trace-disagrees");
+                }
+                continue;
+            }
+            ClassData body = bodies.get(typeId);
+            String typeName = body != null && body.targetTypeName != null ? body.targetTypeName :
+                serializedTypeName(displayTypeName(typeId, null, datatypeGenerics, datatypeNames, new HashSet<>()));
+            if (typeName == null) {
+                addSkipped(actions, "any_creator", address, typeId, "missing-type-name");
+                continue;
+            }
+            if (!isExecutableAddress(parseCaptureAddress(address))) {
+                addSkipped(actions, "any_creator", address, typeName, "non-executable-target");
+                continue;
+            }
+            renameFunction("any_creator", address, classRegistrationScope(typeName), "AnyCreator",
+                groups, functionSeen, aliasSeen, actions);
+        }
     }
 
     private void rememberClassRegistrationFunction(
@@ -13945,6 +14017,8 @@ public class AzReflectionRenamer extends GhidraScript {
         TypeEvidenceIndex typeEvidence;
         LinkedHashMap<String, CapturedRttiHelper> capturedRttiHelpers;
         LinkedHashMap<String, CapturedTypeIdGetter> capturedTypeIdGetters;
+        /** Normalized type id to its uuidAnyCreationMap creator. */
+        LinkedHashMap<String, String> anyCreators = new LinkedHashMap<>();
     }
 
     /** A helper the dump located: an AZ_RTTI block in a class vtable or an RttiHelper<T> vftable. */

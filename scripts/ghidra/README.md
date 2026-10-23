@@ -48,6 +48,11 @@ do not exist. Module captures record only the module's vtable; its name comes fr
 that vtable's `RTTI_GetTypeName` slot in the binary, with a built-in table as
 fallback. A module that neither names is counted in `unrecognizedInputs` and
 skipped without blocking the import.
+`serialize.json`'s `uuidAnyCreationMap` names each type's
+`AZ::SerializeContext::Class<T>::AnyCreator` when no class-registration trace
+covers that type. A creator body several types share (non-copyable types fold
+onto one empty-any body) gets an alias per type. Creators outside executable
+memory, and type ids that no capture names, are skipped and reported.
 Registration-trace callsites and their owning functions are resolved once before
 validation, so apply renames exactly what validation checked even after earlier
 apply phases create functions.
@@ -433,6 +438,9 @@ Ghidra installation directory and a temporary output directory.
 AZ_RTTI blocks and getters with folded and shared bodies, stale six-slot names,
 names shared by distinct types, shared UUIDs and a capture the binary
 contradicts, with the same two arguments.
+`tests/AzReflectionAnyCreatorTest.java` checks `uuidAnyCreationMap` creators,
+shared creator bodies, a creator outside code, an unnamed type id and retries,
+with the same two arguments.
 `tests/AzReflectionRepeatedNamesTest.java` checks repeated native RTTI tables and
 bodies, MB generic functions and namespace repair at separate addresses, with the
 same two arguments.
