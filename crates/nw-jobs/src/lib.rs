@@ -160,9 +160,7 @@ impl JobRunner {
             None => Ok(Self::automatic()),
             Some(0) => Ok(Self::inline()),
             Some(workers) => {
-                let _ = ThreadPoolBuilder::new()
-                    .num_threads(workers)
-                    .build_global();
+                let _ = ThreadPoolBuilder::new().num_threads(workers).build_global();
                 Ok(Self::automatic())
             }
         }
