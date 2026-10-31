@@ -367,6 +367,24 @@ mod tests {
     }
 
     #[test]
+    fn lua_modes_accept_the_game_script_asset_prefix() -> Result<()> {
+        let prefixed = [&[0x04, 0x00][..], SHOPCOMMON].concat();
+        for mode in [LuaMode::Disassemble, LuaMode::Decompile, LuaMode::SsaDump] {
+            let render = LuaRender {
+                mode,
+                no_idiomatic: false,
+                table: None,
+            };
+            let path = Path::new("shopcommon.luac");
+            assert_eq!(
+                render_lua(&prefixed, path, render)?,
+                render_lua(SHOPCOMMON, path, render)?,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn lua_batch_outputs_mirror_input_layout() -> Result<()> {
         let root = Path::new("in");
         let source = Path::new("in/scripts/ui/shopcommon.luac");

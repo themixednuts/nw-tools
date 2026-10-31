@@ -55,24 +55,45 @@ impl<'a> StatementBuilder<'a> {
         };
 
         let mut names = Vec::new();
+        let mut targets = Vec::new();
         for reg in *start..=*end {
-            let Some(binding) = self.names.binding_for_def(reg, node.pc) else {
-                continue;
-            };
             let reference = node.def_at_reg(reg).unwrap_or_else(|| SsaRef::reg(reg));
+            let binding = self.names.binding_for_def(reg, node.pc);
+            if binding.is_none() && !self.should_materialize_ref(reference) {
+                continue;
+            }
+            let name = binding.as_ref().map_or_else(
+                || {
+                    self.plan
+                        .name(reference)
+                        .unwrap_or_else(|| self.names.name_for_ref(reference, node.pc))
+                },
+                |binding| self.names.name_for_binding_def(binding, reference),
+            );
             if self.claim_declaration(reference) {
                 self.exprs.activate(reference);
-                names.push(self.names.name_for_binding_def(&binding, reference));
+                names.push(name);
+            } else if binding.is_none() {
+                self.exprs.activate(reference);
+                targets.push(Expr::Name(name));
             }
         }
-        if names.is_empty() {
-            return Ok(None);
+        match (names.is_empty(), targets.is_empty()) {
+            (true, true) => Ok(None),
+            (false, true) => Ok(Some(Stmt::Local {
+                names,
+                attribs: Vec::new(),
+                values: Vec::new(),
+            })),
+            (true, false) => Ok(Some(Stmt::Assign {
+                targets,
+                values: vec![Expr::Nil],
+            })),
+            (false, false) => Err(LuaError::Emit(format!(
+                "LOADNIL at pc {} both declares and reassigns locals",
+                node.pc
+            ))),
         }
-        Ok(Some(Stmt::Local {
-            names,
-            attribs: Vec::new(),
-            values: Vec::new(),
-        }))
     }
 
     pub(crate) fn should_materialize(&self, node: &SsaNode) -> bool {

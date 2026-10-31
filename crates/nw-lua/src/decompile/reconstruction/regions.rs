@@ -4,11 +4,11 @@ use std::collections::HashSet;
 
 use crate::{
     decompile::{
-        analysis::NodeId,
+        analysis::{DecompileAnalysis, NodeId},
         boolean::BooleanAnalysis,
         control_flow::{RegionTree, conditionals, regions::Region},
     },
-    ir::{SsaFunction, SsaNode, SsaOp, SsaRef},
+    ir::{BasicBlock, SsaFunction, SsaNode, SsaOp, SsaRef},
 };
 
 pub(super) fn collect_forced_loop_values(
@@ -55,6 +55,49 @@ pub(super) fn collect_forced_loop_values(
         }
         Region::Value(_) | Region::Linear(_) | Region::Break => {}
     }
+}
+
+/// Force every source of a live PHI that no value region computes.
+///
+/// A source read only through a PHI has no reader of its own, so without this
+/// it counts as dead and its write, along with any call it holds, disappears
+/// while later statements still read the shared binding.
+pub(super) fn collect_forced_merge_values(
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    booleans: &BooleanAnalysis,
+    forced: &mut HashSet<SsaRef>,
+) {
+    for block in &function.blocks {
+        if booleans.value_select_covering(block.index).is_some() {
+            continue;
+        }
+        let control = loop_control_registers(block);
+        let phis = conditionals::phi_sources(function, block.index);
+        for phi in &phis {
+            let is_control = phi
+                .dest
+                .reg_index()
+                .is_some_and(|reg| control.is_some_and(|(start, end)| reg >= start && reg <= end));
+            if !is_control
+                && booleans.value_for_phi(phi.dest).is_none()
+                && analysis.reaches_real_use(function, phi.dest)
+            {
+                forced.insert(phi.dest);
+                forced.extend(phi.sources.iter().map(|(_, operand)| *operand));
+            }
+        }
+    }
+}
+
+/// Return the registers a loop header in this block keeps for its own control.
+fn loop_control_registers(block: &BasicBlock) -> Option<(u16, u16)> {
+    block.nodes.iter().find_map(|node| match &node.op {
+        SsaOp::ForLoop { control, .. } | SsaOp::TForLoop { control, .. } => {
+            Some((control.base(), control.base().saturating_add(2)))
+        }
+        _ => None,
+    })
 }
 
 pub(super) fn collect_control_blocks(

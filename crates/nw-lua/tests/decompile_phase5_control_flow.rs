@@ -11,6 +11,21 @@ const IF_ELSE_PHI: &[u8] = include_bytes!("fixtures/control_flow/if_else_phi.lua
 const IF_ELSEIF_ELSE: &[u8] = include_bytes!("fixtures/control_flow/if_elseif_else.luac");
 const GENERIC_FOR: &[u8] = include_bytes!("fixtures/control_flow/generic_for.luac");
 const NESTED_FOR_IF: &[u8] = include_bytes!("fixtures/control_flow/nested_for_if.luac");
+const ENTRY_NIL_LOCAL: &[u8] = include_bytes!("fixtures/control_flow/entry_nil_local.luac");
+const LOCAL_BEFORE_NESTED_IF: &[u8] =
+    include_bytes!("fixtures/control_flow/local_before_nested_if.luac");
+const BREAK_WRITES_LOCAL: &[u8] = include_bytes!("fixtures/control_flow/break_writes_local.luac");
+const LOADNIL_RANGE_LOCALS: &[u8] =
+    include_bytes!("fixtures/control_flow/loadnil_range_locals.luac");
+const CALL_IN_PHI_ARMS: &[u8] = include_bytes!("fixtures/control_flow/call_in_phi_arms.luac");
+const ARM_WRITES_TWO_LOCALS: &[u8] =
+    include_bytes!("fixtures/control_flow/arm_writes_two_locals.luac");
+const OR_CALL_WITH_TABLE_ARG: &[u8] =
+    include_bytes!("fixtures/control_flow/or_call_with_table_arg.luac");
+const EMPTY_ARMS_GATE_ELSE: &[u8] =
+    include_bytes!("fixtures/control_flow/empty_arms_gate_else.luac");
+const SELECT_IN_SELECT_ARM: &[u8] =
+    include_bytes!("fixtures/control_flow/select_in_select_arm.luac");
 
 #[test]
 fn control_flow_fixtures_decompile_and_reparse() {
@@ -40,6 +55,81 @@ fn control_flow_fixtures_decompile_and_reparse() {
             );
         }
     }
+}
+
+#[test]
+fn stripped_local_with_no_load_nil_is_declared_at_function_entry() {
+    let source = decompile(ENTRY_NIL_LOCAL).expect("decompile succeeds");
+    let declaration = source.find("local l1, l2").expect(&source);
+    let loop_start = source.find("for ").expect(&source);
+    assert!(declaration < loop_start, "{source}");
+    assert_eq!(source.matches("local l1").count(), 1, "{source}");
+    assert!(source.contains("return l1, l2"), "{source}");
+}
+
+#[test]
+fn local_read_by_a_nested_if_stays_in_the_else_block() {
+    let source = decompile(LOCAL_BEFORE_NESTED_IF).expect("decompile succeeds");
+    let else_start = source.find("else\n").expect(&source);
+    let declaration = source.find("local l3 = a1[a0]").expect(&source);
+    assert!(else_start < declaration, "{source}");
+    assert_eq!(source.matches("elseif").count(), 1, "{source}");
+}
+
+#[test]
+fn local_written_before_a_break_keeps_both_writes() {
+    let source = decompile(BREAK_WRITES_LOCAL).expect("decompile succeeds");
+    assert!(source.contains("= false"), "{source}");
+    assert!(source.contains("= true"), "{source}");
+    assert!(source.contains("break"), "{source}");
+}
+
+#[test]
+fn loadnil_range_declares_every_register_it_clears() {
+    let source = decompile(LOADNIL_RANGE_LOCALS).expect("decompile succeeds");
+    let loop_start = source.find("for ").expect(&source);
+    assert!(source[..loop_start].contains("local l1, l2"), "{source}");
+}
+
+#[test]
+fn calls_moved_into_a_phi_stay_in_their_arms() {
+    let source = decompile(CALL_IN_PHI_ARMS).expect("decompile succeeds");
+    assert!(source.contains("load_first("), "{source}");
+    assert!(source.contains("load_second("), "{source}");
+    assert!(source.contains("elseif"), "{source}");
+    let report = source.find("report(").expect(&source);
+    let else_start = source.find("else\n").expect(&source);
+    assert!(else_start < report, "{source}");
+}
+
+#[test]
+fn value_select_leaves_arms_that_write_another_local() {
+    let source = decompile(ARM_WRITES_TWO_LOCALS).expect("decompile succeeds");
+    assert!(source.contains("l2[l1]"), "{source}");
+    assert!(source.contains("l3[l1]"), "{source}");
+    assert!(source.contains("= false"), "{source}");
+    assert!(source.contains("= true"), "{source}");
+}
+
+#[test]
+fn or_fallback_call_keeps_its_table_argument() {
+    let source = decompile(OR_CALL_WITH_TABLE_ARG).expect("decompile succeeds");
+    assert!(source.contains(" and \"\" or format("), "{source}");
+    assert!(source.contains("level = "), "{source}");
+}
+
+#[test]
+fn select_nested_in_a_select_arm_fails_instead_of_dropping_code() {
+    let error = decompile(SELECT_IN_SELECT_ARM).expect_err("nested select is not supported");
+    assert!(error.to_string().contains("jumps past"), "{error}");
+}
+
+#[test]
+fn empty_arms_still_gate_the_else_block() {
+    let source = decompile(EMPTY_ARMS_GATE_ELSE).expect("decompile succeeds");
+    let missing = source.find("\"missing\"").expect(&source);
+    assert!(source[..missing].contains("if "), "{source}");
+    assert!(source.contains("\"done\""), "{source}");
 }
 
 #[test]

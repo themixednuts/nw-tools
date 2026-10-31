@@ -1,6 +1,8 @@
 //! One-time SSA facts used by Phase 4 reconstruction.
 
-use crate::ir::{SsaFunction, SsaNode, SsaRef, UseRole};
+use std::collections::HashSet;
+
+use crate::ir::{SsaFunction, SsaNode, SsaOp, SsaRef, UseRole};
 
 /// Stable identifier for a node inside an [`SsaFunction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,6 +84,27 @@ impl DecompileAnalysis {
     pub fn real_use_count(&self, reference: SsaRef) -> usize {
         let facts = self.facts(reference);
         facts.uses.saturating_sub(facts.phi_uses)
+    }
+
+    /// Return whether a value is read by a non-phi node, directly or through phis.
+    #[must_use]
+    pub fn reaches_real_use(&self, function: &SsaFunction, value: SsaRef) -> bool {
+        let mut seen = HashSet::from([value]);
+        let mut pending = vec![value];
+        while let Some(current) = pending.pop() {
+            if self.real_use_count(current) > 0 {
+                return true;
+            }
+            for node in function.blocks.iter().flat_map(|block| &block.nodes) {
+                if let SsaOp::Phi { operands, .. } = &node.op
+                    && operands.contains(&current)
+                    && seen.insert(node.dest)
+                {
+                    pending.push(node.dest);
+                }
+            }
+        }
+        false
     }
 
     /// Return non-phi use sites for a versioned register.

@@ -151,6 +151,38 @@ fn finds_mannequin_fragment_content() {
 }
 
 #[test]
+fn finds_decompiled_lua_source_in_game_luac_entries() {
+    const SHOPCOMMON: &[u8] = include_bytes!("../../nw-lua/tests/fixtures/shopcommon.luac");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = write_pak(
+        dir.path(),
+        "test.pak",
+        vec![Entry::new(
+            "scripts/ui/shopcommon.luac",
+            [&[0x04, 0x00][..], SHOPCOMMON].concat(),
+            Method::Store,
+        )],
+    );
+    // `function ` exists only in decompiled text, never in the bytecode.
+    let report = run(&GrepRequest {
+        root,
+        queries: vec!["function ".to_string()],
+        exact: true,
+    })
+    .unwrap();
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(!report.hits.is_empty());
+    assert!(
+        report
+            .hits
+            .iter()
+            .all(|hit| hit.entry == "scripts/ui/shopcommon.luac"
+                && hit.location.starts_with("line "))
+    );
+}
+
+#[test]
 fn crc_lookup_works_live_without_an_index() {
     use nw_tools::grep::find;
     use nw_tools::index::Lookup;
@@ -172,10 +204,7 @@ fn crc_lookup_works_live_without_an_index() {
         Lookup::value("IronSword"),
     )
     .unwrap();
-    assert!(
-        hits.iter().any(|hit| hit.value == "IronSword"),
-        "{hits:?}"
-    );
+    assert!(hits.iter().any(|hit| hit.value == "IronSword"), "{hits:?}");
     assert!(
         find::lookup(
             find::Source::Auto {

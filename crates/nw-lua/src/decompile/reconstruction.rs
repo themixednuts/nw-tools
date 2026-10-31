@@ -23,7 +23,8 @@ use crate::{
 mod regions;
 
 use regions::{
-    collect_control_blocks, collect_emittable_nodes, collect_forced_loop_values, emission_sequences,
+    collect_control_blocks, collect_emittable_nodes, collect_forced_loop_values,
+    collect_forced_merge_values, emission_sequences,
 };
 
 /// The one reconstruction role assigned to an SSA definition.
@@ -96,6 +97,10 @@ impl ReconstructionPlan {
     ) -> Self {
         let mut plan = Self::empty(function);
         plan.entry_declarations = names.implicit_entry_declarations();
+        plan.entry_declarations
+            .extend(entry_nil_register_declarations(
+                proto, function, analysis, names,
+            ));
         plan.discover_constructors(function, analysis);
 
         let mut forced = captured_binding_values(function, analysis, names);
@@ -103,6 +108,7 @@ impl ReconstructionPlan {
         let mut emittable_nodes = HashSet::new();
         if let Some(regions) = regions {
             collect_forced_loop_values(&regions.root, function, &mut forced);
+            collect_forced_merge_values(function, analysis, booleans, &mut forced);
             collect_control_blocks(&regions.root, booleans, &mut control_blocks);
             collect_emittable_nodes(&regions.root, &mut emittable_nodes);
         } else {
@@ -470,6 +476,33 @@ impl ReconstructionPlan {
             };
         }
     }
+}
+
+/// Declare the registers a stripped chunk reads before writing them.
+///
+/// Lua 5.1 clears a frame to `nil` on entry, so `luaK_nil` emits no `LOADNIL`
+/// for a `local` at pc 0. Without debug lifetimes for
+/// [`NameResolver::implicit_entry_declarations`], the read of such a register's
+/// entry value is the only trace of that declaration.
+fn entry_nil_register_declarations(
+    proto: &Proto,
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    names: &NameResolver<'_>,
+) -> Vec<Name> {
+    let first = u16::from(proto.num_params);
+    let last = u16::try_from(function.num_regs).unwrap_or(u16::MAX);
+    (first..last)
+        .map(|reg| SsaRef::Reg { reg, ver: 0 })
+        .filter(|entry| analysis.def_site(*entry).is_none())
+        .filter(|entry| analysis.reaches_real_use(function, *entry))
+        .filter(|entry| {
+            names
+                .binding_id_for_ref(*entry)
+                .is_some_and(|binding| !binding.is_debug_local())
+        })
+        .map(|entry| names.name_for_ref(entry, 0))
+        .collect()
 }
 
 fn captured_binding_values(
