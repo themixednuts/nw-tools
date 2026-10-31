@@ -36,7 +36,6 @@ pub(super) fn and_or_value_chain(
                 first.node,
                 start,
                 merge,
-                &phi,
             ) {
                 continue;
             }
@@ -77,7 +76,6 @@ fn pure_select_range_with_constructor_arms(
     branch: crate::decompile::analysis::NodeId,
     start: usize,
     merge: usize,
-    phi: &PhiSource,
 ) -> bool {
     if pure_select_range(function, branch, start, merge) {
         return true;
@@ -96,61 +94,31 @@ fn pure_select_range_with_constructor_arms(
                 .skip(first_node)
                 .all(|(node_index, node)| {
                     is_pure_value_node(node)
-                        || is_phi_constructor_mutation(
-                            function,
-                            expr_analysis,
-                            phi,
-                            block,
-                            node_index,
-                            node,
-                        )
+                        || is_fresh_table_mutation(function, expr_analysis, block, node_index, node)
                 })
         })
 }
 
-fn is_phi_constructor_mutation(
+/// Return whether a node fills a table its own block built, as a constructor does,
+/// whether that table is the selected value or an argument of the selected call.
+fn is_fresh_table_mutation(
     function: &SsaFunction,
     expr_analysis: &DecompileAnalysis,
-    phi: &PhiSource,
     block: usize,
     node_index: usize,
     node: &crate::ir::SsaNode,
 ) -> bool {
-    phi.sources.iter().any(|(source_block, operand)| {
-        if *source_block != block {
-            return false;
-        }
-        let Some(def_id) = expr_analysis.def_site(*operand) else {
-            return false;
-        };
-        if def_id.block != block || def_id.node >= node_index {
-            return false;
-        }
-        let Some(def) = function
-            .blocks
-            .get(def_id.block)
-            .and_then(|block| block.nodes.get(def_id.node))
-        else {
-            return false;
-        };
-        let Some(table_reg) = def.dest.reg_index() else {
-            return false;
-        };
-        matches!(def.op, SsaOp::NewTable { .. })
-            && is_constructor_mutation_for(node, def.dest, table_reg)
-    })
-}
-
-fn is_constructor_mutation_for(node: &crate::ir::SsaNode, table: SsaRef, table_reg: u16) -> bool {
-    match &node.op {
-        SsaOp::SetTable {
-            table: set_table, ..
-        } => *set_table == table || set_table.reg_index() == Some(table_reg),
-        SsaOp::SetList {
-            table: set_table, ..
-        } => *set_table == table || set_table.reg_index() == Some(table_reg),
-        _ => false,
-    }
+    let (SsaOp::SetTable { table, .. } | SsaOp::SetList { table, .. }) = &node.op else {
+        return false;
+    };
+    let Some(def_id) = expr_analysis.def_site(*table) else {
+        return false;
+    };
+    def_id.block == block
+        && def_id.node < node_index
+        && expr_analysis
+            .node(function, def_id)
+            .is_some_and(|def| matches!(def.op, SsaOp::NewTable { .. }))
 }
 
 fn candidate_phi_merges(

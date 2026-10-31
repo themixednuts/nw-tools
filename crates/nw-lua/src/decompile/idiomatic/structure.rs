@@ -121,15 +121,18 @@ impl Rule for EmptyBranchCleanup {
         for stmt in block.0 {
             if let Stmt::If { arms, else_ } = stmt {
                 let original_arm_count = arms.len();
-                let arms = arms
-                    .into_iter()
-                    .filter(|(_, body)| !body.0.is_empty())
-                    .collect::<Vec<_>>();
                 let else_ = else_.filter(|body| !body.0.is_empty());
+                // An empty arm still gates the arms after it and the else block, so
+                // only the ones with nothing after them can go.
+                let keep = if else_.is_some() {
+                    arms.len()
+                } else {
+                    arms.iter()
+                        .rposition(|(_, body)| !body.0.is_empty())
+                        .map_or(0, |last| last + 1)
+                };
+                let arms = arms.into_iter().take(keep).collect::<Vec<_>>();
                 if arms.is_empty() {
-                    if let Some(else_block) = else_ {
-                        out.extend(else_block.0);
-                    }
                     changed = true;
                     continue;
                 }

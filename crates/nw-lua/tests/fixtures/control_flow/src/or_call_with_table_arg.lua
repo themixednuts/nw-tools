@@ -1,0 +1,3 @@
+local enabled, level = ...
+local text = enabled and "" or format("requirement", { level = level })
+return text

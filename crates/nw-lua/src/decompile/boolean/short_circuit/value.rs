@@ -9,17 +9,98 @@ pub fn value_plan(
     start: usize,
     pc_map: &[Option<usize>],
 ) -> Option<ValuePlan> {
+    let closed = |plan: &ValuePlan| plan_is_closed(function, expr_analysis, plan);
     super::super::value_chain::and_or_value_chain(function, expr_analysis, start, pc_map)
-        .or_else(|| super::guards::guarded_condition_value(function, start, pc_map))
-        .or_else(|| condition_bool_chain_value(function, expr_analysis, start, pc_map))
-        .or_else(|| super::guards::guarded_or_value(function, expr_analysis, start, pc_map))
-        .or_else(|| super::guards::comparison_guard_value(function, expr_analysis, start, pc_map))
-        .or_else(|| super::selectors::comparison_value(function, start, pc_map))
-        .or_else(|| super::selectors::test_value(function, expr_analysis, start, pc_map))
-        .or_else(|| super::guards::guarded_chain_value(function, expr_analysis, start, pc_map))
-        .or_else(|| super::selectors::branch_ternary_value(function, expr_analysis, start, pc_map))
-        .or_else(|| super::selectors::ternary_value(function, expr_analysis, start, pc_map))
-        .or_else(|| super::selectors::testset_value(function, expr_analysis, start, pc_map))
+        .filter(closed)
+        .or_else(|| super::guards::guarded_condition_value(function, start, pc_map).filter(closed))
+        .or_else(|| {
+            condition_bool_chain_value(function, expr_analysis, start, pc_map).filter(closed)
+        })
+        .or_else(|| {
+            super::guards::guarded_or_value(function, expr_analysis, start, pc_map).filter(closed)
+        })
+        .or_else(|| {
+            super::guards::comparison_guard_value(function, expr_analysis, start, pc_map)
+                .filter(closed)
+        })
+        .or_else(|| super::selectors::comparison_value(function, start, pc_map).filter(closed))
+        .or_else(|| {
+            super::selectors::test_value(function, expr_analysis, start, pc_map).filter(closed)
+        })
+        .or_else(|| {
+            super::guards::guarded_chain_value(function, expr_analysis, start, pc_map)
+                .filter(closed)
+        })
+        .or_else(|| {
+            super::selectors::branch_ternary_value(function, expr_analysis, start, pc_map)
+                .filter(closed)
+        })
+        .or_else(|| {
+            super::selectors::ternary_value(function, expr_analysis, start, pc_map).filter(closed)
+        })
+        .or_else(|| {
+            super::selectors::testset_value(function, expr_analysis, start, pc_map).filter(closed)
+        })
+}
+
+/// Return whether replacing a plan's blocks with one expression loses nothing.
+///
+/// Region assembly drops every block in `start..merge` after the start block's
+/// branch, so no value defined there other than the plan's PHI may be read later.
+fn plan_is_closed(
+    function: &SsaFunction,
+    expr_analysis: &DecompileAnalysis,
+    plan: &ValuePlan,
+) -> bool {
+    plan.consumed_blocks().all(|block| {
+        let Some(block_ref) = function.blocks.get(block) else {
+            return false;
+        };
+        let first_node = if block == plan.start {
+            block_ref
+                .nodes
+                .iter()
+                .position(|node| matches!(node.op, SsaOp::Branch { .. }))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        (first_node..block_ref.nodes.len()).all(|node| {
+            expr_analysis
+                .defs_at(NodeId { block, node })
+                .iter()
+                .all(|def| value_stays_inside(function, expr_analysis, plan, *def))
+        })
+    })
+}
+
+/// Return whether a value defined in a plan is only read inside it or by its PHI.
+fn value_stays_inside(
+    function: &SsaFunction,
+    expr_analysis: &DecompileAnalysis,
+    plan: &ValuePlan,
+    def: SsaRef,
+) -> bool {
+    if def == plan.dest {
+        return true;
+    }
+    let inside = |block: usize| plan.consumed_blocks().contains(&block);
+    expr_analysis.facts(def).upvalue_captures == 0
+        && expr_analysis
+            .real_uses(def)
+            .iter()
+            .all(|user| inside(user.block))
+        && function
+            .blocks
+            .iter()
+            .filter(|block| !inside(block.index))
+            .flat_map(|block| &block.nodes)
+            .all(|node| match &node.op {
+                SsaOp::Phi { operands, .. } if operands.contains(&def) => {
+                    node.dest == plan.dest || !expr_analysis.reaches_real_use(function, node.dest)
+                }
+                _ => true,
+            })
 }
 
 pub(super) fn condition_bool_chain_value(

@@ -87,6 +87,11 @@ fn lower_if(
     booleans: &BooleanAnalysis,
     builder: &mut StatementBuilder<'_>,
 ) -> Result<Vec<Stmt>, LuaError> {
+    if let Some(block) = branch_past_merge(region, function, booleans) {
+        return Err(LuaError::Emit(format!(
+            "branch in block {block} jumps past its if statement"
+        )));
+    }
     if let Some(stmts) = lower_boolean_value_if(region, function, analysis, booleans, builder)? {
         return Ok(stmts);
     }
@@ -143,6 +148,50 @@ fn lower_if(
 
     out.push(Stmt::If { arms, else_ });
     Ok(out)
+}
+
+/// Return the block of an empty arm whose branch leaves the if statement.
+///
+/// An arm with no blocks and no statements says both edges of its branch end at
+/// the merge. If one goes elsewhere, the statement would run code the bytecode
+/// skips, so lowering reports it instead. A block a boolean expression owns is
+/// already part of that expression, so a branch in or into one goes nowhere new.
+/// A select nested in an arm of another select, `a and f(b or c) or d`, reaches
+/// this check because the outer select has no value plan.
+fn branch_past_merge(
+    region: &IfRegion,
+    function: &SsaFunction,
+    booleans: &BooleanAnalysis,
+) -> Option<usize> {
+    let merge = region.merge?;
+    let expression_blocks = booleans.expression_blocks();
+    let is_inside = |target: usize| {
+        target == merge
+            || expression_blocks.contains(&target)
+            || booleans.value_select_covering(target).is_some()
+            || region.else_blocks.contains(&target)
+            || region
+                .arms
+                .iter()
+                .any(|arm| arm.condition.branch.block == target || arm.blocks.contains(&target))
+    };
+    region
+        .arms
+        .iter()
+        .filter(|arm| {
+            arm.blocks.is_empty()
+                && arm.condition.compound.is_none()
+                && !expression_blocks.contains(&arm.condition.branch.block)
+                && matches!(&arm.body, Region::Sequence(body) if body.is_empty())
+        })
+        .find(|arm| {
+            branch_targets(function, arm.condition.branch).is_some_and(|(left, right)| {
+                [left, right].into_iter().any(|target| {
+                    !is_inside(conditionals::follow_jmp_only(function, target, Some(merge)))
+                })
+            })
+        })
+        .map(|arm| arm.condition.branch.block)
 }
 
 fn visible_if_phis(region: &IfRegion, function: &SsaFunction) -> Vec<PhiSource> {

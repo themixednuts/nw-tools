@@ -13,6 +13,7 @@ pub mod idiomatic;
 pub mod naming;
 pub mod reconstruction;
 pub mod region;
+mod scope;
 pub mod stmt_build;
 
 pub mod multi;
@@ -104,5 +105,7 @@ pub(crate) fn decompile_proto_with_names(
     table: &OpcodeTable,
     names: &naming::NameResolver<'_>,
 ) -> Result<ast::Block, LuaError> {
-    control_flow::lower_with_names(proto, ssa, table, names)
+    let mut block = control_flow::lower_with_names(proto, ssa, table, names)?;
+    scope::hoist_out_of_scope_locals(&mut block);
+    Ok(block)
 }

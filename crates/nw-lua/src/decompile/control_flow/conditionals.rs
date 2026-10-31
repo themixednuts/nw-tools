@@ -225,9 +225,23 @@ pub fn is_elseif_candidate(
             .visit_uses(|operand, _| pending.push(operand));
     }
 
+    // A value read past the branch is a local declared before a nested `if`, and
+    // `elseif` has nowhere to put that declaration.
+    let read_only_by_condition = |index: usize| {
+        analysis
+            .defs_at(NodeId { block, node: index })
+            .iter()
+            .flat_map(|definition| analysis.real_uses(*definition))
+            .all(|user| {
+                user.block == block
+                    && (user.node == branch.node.node
+                        || condition_nodes.get(user.node).copied().unwrap_or(false))
+            })
+    };
+
     block_ref.nodes.iter().enumerate().all(|(index, node)| {
         index == branch.node.node
-            || condition_nodes[index]
+            || (condition_nodes[index] && read_only_by_condition(index))
             || matches!(node.op, SsaOp::Phi { .. } | SsaOp::Nop)
     })
 }

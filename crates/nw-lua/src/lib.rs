@@ -248,7 +248,15 @@ fn decompile_chunk_with_table_options_and_module_stem(
         options,
         fallback_module_stem,
     )?;
-    emit::to_source(&block)
+    let source = emit::to_source(&block)?;
+    // An empty script compiles to its one final RETURN; anything longer lost code.
+    if source.trim().is_empty() && chunk.root.code.len() > 1 {
+        return Err(LuaError::Emit(format!(
+            "decompiled {} instructions to empty source",
+            chunk.root.code.len()
+        )));
+    }
+    Ok(source)
 }
 
 fn reconstruct_chunk_with_table_options_and_module_stem(
