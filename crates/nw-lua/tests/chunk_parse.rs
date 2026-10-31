@@ -1,4 +1,5 @@
 use nw_lua::{
+    LuaError,
     chunk::{Constant, Proto},
     parse_chunk,
     version::LuaTarget,
@@ -37,6 +38,28 @@ fn parses_shopcommon_lua_51_chunk() {
         }
     });
     assert!(string_constants > 0);
+}
+
+#[test]
+fn skips_the_script_asset_prefix_on_game_chunks() {
+    let prefixed = [&[0x04, 0x00][..], SHOPCOMMON].concat();
+
+    assert_eq!(
+        parse_chunk(&prefixed).expect("prefixed chunk parses"),
+        parse_chunk(SHOPCOMMON).expect("bare chunk parses"),
+    );
+}
+
+#[test]
+fn rejects_other_bytes_before_the_chunk() {
+    for prefix in [[0x04, 0x01], [0x03, 0x00], [0x00, 0x00]] {
+        let bytes = [&prefix[..], SHOPCOMMON].concat();
+        assert!(matches!(parse_chunk(&bytes), Err(LuaError::BadMagic)));
+    }
+    assert!(matches!(
+        parse_chunk(&[0x04, 0x00, 0x00, 0x00, 0x00, 0x00]),
+        Err(LuaError::BadMagic)
+    ));
 }
 
 fn count_nested_protos(proto: &Proto) -> usize {

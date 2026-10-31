@@ -7,7 +7,7 @@ use crate::{
 
 use super::{Header, reader::ByteReader};
 
-const LUA_MAGIC: &[u8; 4] = b"\x1bLua";
+pub(super) const LUA_MAGIC: &[u8; 4] = b"\x1bLua";
 const LUAC_FORMAT_OFFICIAL: u8 = 0;
 const LUAC_INSTRUCTION_SIZE_51: u8 = 4;
 

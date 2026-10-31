@@ -24,7 +24,7 @@ const EXTRACT_CHUNK: usize = 256;
 const VERSION_KEY: &str = "content_index_version";
 const ROOT_KEY: &str = "content_index_root";
 // Extraction and stamp semantics must invalidate caches produced by older code.
-const VERSION: &str = "2";
+const VERSION: &str = "3";
 
 type PakStamp = (String, PathBuf, Option<(i64, i64)>);
 

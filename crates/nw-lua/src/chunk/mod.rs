@@ -114,13 +114,26 @@ pub struct UpvalDesc {
     pub name: BString,
 }
 
-/// Parse a Lua binary chunk.
+/// `AZ::ScriptAsset` bytes New World writes before a compiled chunk: the asset
+/// version `4`, then `AssetTypeCompiled` (`0`).
+const SCRIPT_ASSET_PREFIX: &[u8; 2] = b"\x04\x00";
+
+/// Return the Lua chunk inside a game `.luac` asset, or `bytes` unchanged when
+/// it is not one.
+fn strip_script_asset_prefix(bytes: &[u8]) -> &[u8] {
+    match bytes.strip_prefix(SCRIPT_ASSET_PREFIX) {
+        Some(chunk) if chunk.starts_with(header::LUA_MAGIC) => chunk,
+        _ => bytes,
+    }
+}
+
+/// Parse a Lua binary chunk, with or without the game's script asset prefix.
 ///
 /// # Errors
 ///
 /// Returns [`LuaError`] when the chunk header or prototype tree is invalid.
 pub fn parse(bytes: &[u8]) -> Result<Chunk, LuaError> {
-    let mut reader = reader::ByteReader::new(bytes);
+    let mut reader = reader::ByteReader::new(strip_script_asset_prefix(bytes));
     let header = header::parse_header(&mut reader)?;
     reader.configure(header);
     let root = proto::parse_root(&mut reader, &header)?;
